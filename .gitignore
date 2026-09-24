@@ -1,0 +1,7 @@
+# Выкладываем только файлы сайта
+/*
+!/index.html
+!/script.js
+!/styles.css
+!/.gitignore
+!/.nojekyll
