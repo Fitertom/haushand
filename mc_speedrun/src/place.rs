@@ -77,11 +77,10 @@ pub fn clicks_for(bot: &Client, target: BlockPos) -> Vec<Click> {
 
     // A replaceable block with an outline (grass) is itself clicked: the new block takes
     // its place, whatever face is hit.
-    let own = outline_boxes(state, target);
-    if !state.is_air() && !own.is_empty() {
-        let b = own[0];
-        let point = Vec3::new((b.min.x + b.max.x) / 2.0, b.max.y, (b.min.z + b.max.z) / 2.0);
-        out.push(Click { target, against: target, face: Direction::Up, point });
+    if !state.is_air() && !outline_boxes(state, target).is_empty()
+        && let Some((face, point)) = click::sight(bot, target)
+    {
+        out.push(Click { target, against: target, face, point });
     }
 
     for face in DIRECTIONS {
@@ -92,24 +91,10 @@ pub fn clicks_for(bot: &Client, target: BlockPos) -> Vec<Click> {
         if replaceable(st) || !click::clickable(world_lock(bot).read().get_block_state(against)) {
             continue;
         }
-        let boxes = outline_boxes(st, against);
-        if boxes.is_empty() {
-            continue;
+        // only a face the eyes see, at a point on it the ray reaches unblocked
+        if let Some(point) = click::visible_point(bot, against, face) {
+            out.push(Click { target, against, face, point });
         }
-        // the box reaching furthest towards the target, and the middle of its face there
-        let n = face.normal();
-        let reach_of = |b: &Aabb| b.max.x * n.x as f64 + b.max.y * n.y as f64 + b.max.z * n.z as f64
-            - (b.min.x * (n.x.min(0)) as f64 + b.min.y * (n.y.min(0)) as f64 + b.min.z * (n.z.min(0)) as f64);
-        let b = boxes.iter().copied().max_by(|a, c| reach_of(a).total_cmp(&reach_of(c))).unwrap();
-        let mid = Vec3::new((b.min.x + b.max.x) / 2.0, (b.min.y + b.max.y) / 2.0, (b.min.z + b.max.z) / 2.0);
-        let point = Vec3::new(
-            match n.x { 1 => b.max.x, -1 => b.min.x, _ => mid.x },
-            match n.y { 1 => b.max.y, -1 => b.min.y, _ => mid.y },
-            match n.z { 1 => b.max.z, -1 => b.min.z, _ => mid.z },
-        );
-        // a face turned away from our eyes is clicked all the same: the server does not
-        // check the line of sight, and a top face above the eyes is the only way to stack
-        out.push(Click { target, against, face, point });
     }
     out.sort_by(|a, b| a.point.distance_squared_to(eye).total_cmp(&b.point.distance_squared_to(eye)));
     out
@@ -123,13 +108,14 @@ pub async fn place_at(bot: &Client, items: &Items, target: BlockPos) -> Result<(
     for attempt in 0..3 {
         let mut clicks = clicks_for(bot, target);
         if clicks.is_empty() {
-            bail!("nothing to click to put a block at {target} (or it would be inside us)");
-        }
-        if click::reach_to(bot, clicks[0].against) > click::REACH {
-            goto_timeout(bot, RadiusGoal::new(target.center(), 3.0), Duration::from_secs(20)).await?;
+            // no face to click seen from here: closer, then look again
+            goto_timeout(bot, RadiusGoal::new(target.center(), 2.5), Duration::from_secs(20)).await?;
             clicks = clicks_for(bot, target);
         }
-        for c in clicks.iter().filter(|c| click::reach_to(bot, c.against) <= click::REACH) {
+        if clicks.is_empty() {
+            bail!("no face seen to put a block at {target} (or it would be inside something)");
+        }
+        for c in &clicks {
             inv::hold(bot, items).await;
             if let Err(e) = click::use_item_on(bot, c.against, c.face, c.point).await {
                 debug!("click {c:?} not sent: {e}");
@@ -185,11 +171,17 @@ pub async fn place_near(bot: &Client, items: &Items) -> Result<BlockPos> {
         if block_at(bot, p).is_air() || replaceable(under) || under.is_collision_shape_empty() {
             continue;
         }
-        if crate::world::mine_at(bot, p).await.is_err() || !block_at(bot, p).is_air() {
+        if let Err(e) = crate::world::mine_at(bot, p).await {
+            info!("niche at {p}: could not dig it: {e}");
             continue;
         }
-        if place_at(bot, items, p).await.is_ok() {
-            return Ok(p);
+        if !block_at(bot, p).is_air() {
+            info!("niche at {p}: still {:?} after digging", BlockKind::from(block_at(bot, p)));
+            continue;
+        }
+        match place_at(bot, items, p).await {
+            Ok(()) => return Ok(p),
+            Err(e) => info!("niche at {p}: {e}"),
         }
     }
     bail!("no spot near {f} to put {items:?}")
