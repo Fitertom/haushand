@@ -12,8 +12,9 @@ use std::{
 use azalea::{
     BlockPos, Client, Vec3, WalkDirection,
     entity::{Physics, metadata},
-    prelude::*,
-    protocol::packets::game::{ServerboundUseItem, s_interact::InteractionHand},
+    protocol::packets::game::{
+        ClientboundGamePacket, ServerboundClientCommand, ServerboundUseItem, s_client_command, s_interact::InteractionHand,
+    },
     registry::builtin::{BlockKind, EntityKind, ItemKind},
 };
 use eyre::Result;
@@ -118,7 +119,17 @@ pub async fn eat(bot: &Client, kind: ItemKind) -> Result<bool> {
     }
     combat::note_item_change(bot);
     bot.walk(WalkDirection::None);
-    bot.wait_ticks(1).await;
+    // the use goes with whatever the server has in our hand: a bucket there would pour
+    for _ in 0..20 {
+        bot.wait_ticks(1).await;
+        if combat::held(bot) == kind {
+            break;
+        }
+    }
+    if combat::held(bot) != kind {
+        warn!("could not hold {kind:?} to eat it");
+        return Ok(false);
+    }
     let hp = combat::health(bot);
     for attempt in 0..2 {
         use_held_item(bot);
@@ -322,7 +333,7 @@ pub async fn escape_hazards(bot: &Client) -> Result<bool> {
             bot.set_jumping(true).ok();
             if let Some(p) = air_at {
                 let me = world::me(bot);
-                bot.look_at(Vec3::new(p.x as f64 + 0.5, me.y + 1.62, p.z as f64 + 0.5));
+                combat::face(bot, Vec3::new(p.x as f64 + 0.5, me.y, p.z as f64 + 0.5));
                 bot.walk(if Vec3::new(p.x as f64 + 0.5 - me.x, 0.0, p.z as f64 + 0.5 - me.z).length() > 0.5 { WalkDirection::Forward } else { WalkDirection::None });
             }
             bot.wait_ticks(1).await;
@@ -349,7 +360,7 @@ pub async fn escape_hazards(bot: &Client) -> Result<bool> {
         if Vec3::new(me.x - target.x, 0.0, me.z - target.z).length() < 0.4 && !in_hazard(bot) {
             break;
         }
-        bot.look_at(Vec3::new(target.x, me.y + 1.62, target.z));
+        combat::face(bot, target);
         bot.sprint(azalea::SprintDirection::Forward);
         bot.set_jumping(true).ok();
         bot.wait_ticks(1).await;
@@ -407,15 +418,47 @@ pub fn tend(bot: &Client) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_
 
 // ---- death -----------------------------------------------------------------------------
 
-/// Waits for the respawn after a death (azalea's auto-respawn sends it), then for the world
-/// around the new spawn, then walks back for what we dropped when it is not far.
-pub async fn after_death(bot: &Client, died_at: Option<Vec3>) {
-    for _ in 0..400 {
-        if combat::alive(bot) {
-            break;
-        }
-        bot.wait_ticks(5).await;
+/// Respawn packets the server sent us: its answer to our respawn request.
+static RESPAWNS: AtomicU64 = AtomicU64::new(0);
+
+/// Watches for the server's respawn (also sent on a dimension change, which is harmless
+/// here: we only compare counts around our own request).
+pub fn packet(_bot: &Client, packet: &ClientboundGamePacket) {
+    if let ClientboundGamePacket::Respawn(_) = packet {
+        RESPAWNS.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Asks the server to respawn us and waits for its answer: a respawn packet and our health
+/// back above 0. The server ignores the request while our health is above 0, so it is
+/// sent only while dead, and again every few seconds when nothing came back (a request
+/// sent in the tick of the death can be read before the death is final).
+pub async fn respawn(bot: &Client) -> bool {
+    let before = RESPAWNS.load(Ordering::Relaxed);
+    let mut sent_at: Option<tokio::time::Instant> = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while tokio::time::Instant::now() < deadline {
+        let answered = RESPAWNS.load(Ordering::Relaxed) > before;
+        if answered && combat::alive(bot) {
+            info!("respawned (the server answered our request)");
+            return true;
+        }
+        if !answered && !combat::alive(bot) && sent_at.is_none_or(|t| t.elapsed() > Duration::from_secs(3)) {
+            bot.write_packet(ServerboundClientCommand { action: s_client_command::Action::PerformRespawn });
+            sent_at = Some(tokio::time::Instant::now());
+        }
+        bot.wait_ticks(1).await;
+    }
+    warn!("no respawn from the server within a minute (alive: {})", combat::alive(bot));
+    combat::alive(bot)
+}
+
+/// Respawns after a death (our own request, azalea's auto-respawn is off), waits for the
+/// world around the new spawn, then walks back for what we dropped when it is not far.
+pub async fn after_death(bot: &Client, died_at: Option<Vec3>) {
+    // the death screen comes with the kill packet; health 0 may land a tick before it
+    bot.wait_ticks(2).await;
+    respawn(bot).await;
     // the respawn moves us; wait until the position settles in loaded chunks
     bot.wait_ticks(20).await;
     world::wait_for_world(bot).await;

@@ -7,7 +7,6 @@
 //! the client.
 
 use std::{
-    collections::HashMap,
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
@@ -16,10 +15,10 @@ use azalea::{
     Client, Vec3, WalkDirection,
     core::entity_id::MinecraftEntityId,
     ecs::{entity::Entity, query::Without},
-    entity::{Dead, EntityKindComponent, LocalEntity, Physics, Position, dimensions::EntityDimensions, metadata},
+    entity::{Dead, EntityKindComponent, LocalEntity, LookDirection, Physics, Position, dimensions::EntityDimensions, metadata},
     pathfinder::goals::{Goal, RadiusGoal},
     prelude::*,
-    protocol::packets::game::ClientboundGamePacket,
+    protocol::packets::game::{ClientboundGamePacket, ServerboundAttack, ServerboundPunch},
     registry::builtin::{EntityKind, ItemKind},
     world::WorldName,
 };
@@ -382,10 +381,54 @@ fn safe_step(bot: &Client, dir: Vec3) -> bool {
     false
 }
 
+/// Sets our yaw and pitch towards `point` without waiting: the movement packet of the next
+/// tick carries them (a rotation packet of our own would make two movement packets in one
+/// tick, which 26.3 kicks for). `click::look` is the same plus the wait.
+pub fn aim(bot: &Client, point: Vec3) {
+    let (yaw, pitch) = crate::click::angles(crate::click::eye(bot), point);
+    let mut ecs = bot.ecs.write();
+    if let Some(mut l) = ecs.get_mut::<LookDirection>(bot.entity) {
+        *l = LookDirection::new(yaw, pitch);
+    }
+}
+
 /// Turns towards `target` (yaw only, eyes level with it), for walking.
-fn face(bot: &Client, target: Vec3) {
-    let me = crate::world::me(bot);
-    bot.look_at(Vec3::new(target.x, me.y + 1.62, target.z));
+pub fn face(bot: &Client, target: Vec3) {
+    let eye = crate::click::eye(bot);
+    aim(bot, Vec3::new(target.x, eye.y, target.z));
+}
+
+/// Hits `target` with what we hold: our own attack packet, then the arm swing.
+///
+/// The server's `handleAttack` checks: the target exists in our world and inside the border,
+/// it is within reach of our eyes (entity interaction range 3.0 to its box, plus a
+/// tolerance), and it is not an item, an orb, an arrow or ourselves (any of those is a
+/// kick for an invalid attack). It does not check the look, but we have looked at it a
+/// tick before, as a player does. The damage scales with the charge: the server counts
+/// ticks since the last swing (`ServerboundPunch` resets the counter, the attack itself
+/// does not), so the punch goes after the attack, and we hit only at full charge.
+/// Returns whether the hit was sent.
+pub fn strike(bot: &Client, target: Entity) -> bool {
+    let Some(m) = mob(bot, target) else { return false };
+    // the same world: a mob row from the dimension we just left is not attackable
+    let ours = bot.component::<WorldName>().ok().map(|w| w.clone());
+    let theirs = bot.ecs.read().get::<WorldName>(target).cloned();
+    if ours.is_none() || ours != theirs || m.entity == bot.entity {
+        return false;
+    }
+    let dist = m.box_distance(crate::click::eye(bot));
+    if dist > REACH || !charged(bot) || !alive(bot) {
+        return false;
+    }
+    bot.write_packet(ServerboundAttack { entity_id: m.id });
+    bot.write_packet(ServerboundPunch);
+    CHARGE_START.store(bot.ticks_connected(), Ordering::Relaxed);
+    // a sprinting hit knocks back and ends the sprint, on the server; walk instead
+    if bot.query_self::<&metadata::Sprinting, _>(|s| s.0).unwrap_or(false) {
+        bot.walk(WalkDirection::Forward);
+    }
+    debug!("hit {:?} (hp {:.0}) at {dist:.2}", m.kind, m.health);
+    true
 }
 
 /// Fights `target` until it dies, leaves, or `limit` passes. Steps of one game tick.
@@ -403,6 +446,7 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
     let mut retreat_until = 0u64;
     let mut fleeing = false;
     let mut hits = 0;
+    let mut want_hit = false;
     // progress: the target's health or distance must change now and then, else it is out
     // of reach (behind a wall, up a cliff) and we leave it
     let mut best = (first.health, first.box_distance(crate::world::me(bot).up(1.62)));
@@ -489,9 +533,9 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
                 crate::world::stop_path(bot).await;
             }
             // aim at the box point nearest our eyes, a tick ahead of its movement
-            let aim = m.nearest_point(eye) + vel;
-            let aim = Vec3::new(aim.x, aim.y.clamp(m.pos.y + 0.1, m.pos.y + m.height - 0.1), aim.z);
-            bot.look_at(aim);
+            let p = m.nearest_point(eye) + vel;
+            let aim_at = Vec3::new(p.x, p.y.clamp(m.pos.y + 0.1, m.pos.y + m.height - 0.1), p.z);
+            aim(bot, aim_at);
             let walk = if now < retreat_until {
                 WalkDirection::Backward
             } else if dist > REACH - 0.6 && role != Role::Flying {
@@ -514,18 +558,17 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
             let forward = matches!(walk, WalkDirection::Forward | WalkDirection::ForwardLeft | WalkDirection::ForwardRight);
             // jumping is swimming up in water: keeps our head out of it
             bot.set_jumping(in_water || (blocked && on_ground && forward)).ok();
-            if dist <= REACH && charged(bot) {
-                bot.attack(target);
-                CHARGE_START.store(now, Ordering::Relaxed);
-                hits += 1;
-                debug!("hit {:?} (hp {:.0}) at {dist:.2}", m.kind, m.health);
-                if role == Role::Creeper {
-                    // its knockback plus our steps back keep it out of its 3-block trigger
-                    retreat_until = now + 10;
-                }
-            }
+            // the hit goes out next tick, after the movement packet with this look
+            want_hit = dist <= REACH + 0.3 && charged(bot);
         }
         bot.wait_ticks(1).await;
+        if std::mem::take(&mut want_hit) && strike(bot, target) {
+            hits += 1;
+            if role == Role::Creeper {
+                // its knockback plus our steps back keep it out of its 3-block trigger
+                retreat_until = bot.ticks_connected() + 10;
+            }
+        }
     };
     if pathing_to.is_some() {
         crate::world::stop_path(bot).await;

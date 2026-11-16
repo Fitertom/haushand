@@ -4,11 +4,13 @@
 //! owner says `!go` (the whole run), `!stage <name>` (one stage, for testing), `!stop`,
 //! `!inv`, `!pos`.
 
+mod click;
 mod combat;
 mod craft;
 mod inv;
 mod obtain;
 mod place;
+mod portal;
 mod telemetry;
 mod run;
 mod survival;
@@ -38,12 +40,14 @@ struct Args {
     autostart: bool,
     /// Quit when the autostarted run ends, so a test does not idle until its timeout.
     exit: bool,
+    /// Game ticks to wait after spawning before an autostarted run (a test gives items first).
+    delay: usize,
     /// Run only this stage on spawn (testing without chat).
     stage: Option<String>,
 }
 
 fn args() -> Args {
-    let mut a = Args { server: "localhost".into(), name: "SpeedBot".into(), owner: None, autostart: false, exit: false, stage: None };
+    let mut a = Args { server: "localhost".into(), name: "SpeedBot".into(), owner: None, autostart: false, exit: false, delay: 0, stage: None };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         match k.as_str() {
@@ -52,6 +56,7 @@ fn args() -> Args {
             "--owner" => a.owner = it.next(),
             "--go" => a.autostart = true,
             "--exit" => a.exit = true,
+            "--delay" => a.delay = it.next().and_then(|v| v.parse().ok()).expect("--delay needs ticks"),
             "--stage" => {
                 a.autostart = true;
                 a.stage = it.next();
@@ -89,7 +94,15 @@ async fn main() -> AppExit {
         Ok(path) => info!("run log: {path}"),
         Err(e) => error!("no run log: {e}"),
     }
-    ClientBuilder::new().set_handler(handle).start(Account::offline(&a.name), a.server.as_str()).await
+    // our own respawn (survival::respawn) waits for the server's answer; azalea's sends the
+    // request on any death event and never looks back
+    use azalea::app::PluginGroup;
+    ClientBuilder::new_without_plugins()
+        .add_plugins(azalea::DefaultPlugins)
+        .add_plugins(azalea::bot::DefaultBotPlugins.build().disable::<azalea::auto_respawn::AutoRespawnPlugin>())
+        .set_handler(handle)
+        .start(Account::offline(&a.name), a.server.as_str())
+        .await
 }
 
 async fn handle(bot: Client, event: Event, state: State) -> eyre::Result<()> {
@@ -102,6 +115,7 @@ async fn handle(bot: Client, event: Event, state: State) -> eyre::Result<()> {
         Event::Packet(p) => {
             telemetry::packet(&bot, &p);
             combat::packet(&bot, &p);
+            survival::packet(&bot, &p);
         }
         Event::Death(_) => on_death(&bot, &state),
         Event::Spawn if a.autostart && state.task.lock().is_none() => start(&bot, &state, a.stage.clone()),
@@ -152,7 +166,14 @@ fn start(bot: &Client, state: &State, stage: Option<String>) {
         t.abort();
     }
     let bot = bot.clone();
-    *task = Some(tokio::spawn(run_task(bot, stage)));
+    *task = Some(tokio::spawn(async move {
+        // a test gives items meanwhile (--delay); a resume after a death does not wait
+        let delay = ARGS.get().map_or(0, |a| a.delay);
+        if delay > 0 {
+            bot.wait_ticks(delay).await;
+        }
+        run_task(bot, stage).await
+    }));
 }
 
 async fn run_task(bot: Client, stage: Option<String>) {
