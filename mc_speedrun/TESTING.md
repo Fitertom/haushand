@@ -4,7 +4,8 @@ Everything here ran in a Linux cloud container (4 cores, 15 GB RAM).
 
 ## Server (Minecraft 26.3)
 
-- Needs Java 25: `apt-get install -y openjdk-25-jre-headless` →
+- Needs Java 25: `apt-get update && apt-get install -y openjdk-25-jre-headless` (the package
+  is not found before `apt-get update` in a fresh container) →
   `/usr/lib/jvm/java-25-openjdk-amd64/bin/java`.
 - Server jar: version manifest `https://piston-meta.mojang.com/mc/game/version_manifest_v2.json`
   → 26.3 → `downloads.server.url`. Put it in `/home/user/mcserver/run/server.jar`.
@@ -20,7 +21,9 @@ Everything here ran in a Linux cloud container (4 cores, 15 GB RAM).
   `gamerule advance_time false` (26.3 name; `doDaylightCycle` no longer exists).
   Useful: `give SpeedBot <item> <n>`, `clear SpeedBot`, `data get entity SpeedBot Pos`,
   `execute if block x y z <block>` (only while the bot keeps the chunk loaded), `tick query`.
-- Fresh world: stop the server, rename `world`, start again.
+- Fresh world: stop the server, rename `world`, start again (`dev/fresh_world.sh`).
+- Run `dev/fresh_world.sh` from a foreground tool call: a server started inside a
+  background job was gone after that job ended (RCON "connection refused").
 
 ## Bot
 
@@ -46,6 +49,20 @@ Everything here ran in a Linux cloud container (4 cores, 15 GB RAM).
   answer instead (menu state id stable, result slot filled, block changed).
 - A click on short grass replaces it: the placed block lands one lower. `place.rs` handles
   replaceable blocks.
+
+- **The world keeps state between tests**: the player's health, inventory and position
+  are saved, and `/time set midnight` from the `fight` test stays (advance_time is off). A
+  later test then starts hurt, at night, among natural mobs. Use a fresh world (or `clear`,
+  `effect give SpeedBot instant_health`, `time set day`) before a test that needs a clean
+  start.
+- `/summon ~6 ~ ~` can put a mob inside a hillside, where it suffocates (1 hp per 10 ticks)
+  and looks like a won fight. Test stages summon via `run::open_spot`.
+- Reading a mob's state on the server over RCON: run it at the bot, or `sort=nearest` picks
+  the entity nearest the world spawn:
+  `execute as SpeedBot at @s run data get entity @e[type=!player,type=!item,sort=nearest,limit=1] Health`
+  (also `Pos`, `HurtTime`).
+- Debug logs of one module: `RUST_LOG=speedrun_bot::combat=debug,speedrun_bot=info,azalea=warn`
+  (per-strike and per-health-change lines of a fight are at debug).
 
 ## Report
 

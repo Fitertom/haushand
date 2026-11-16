@@ -1,4 +1,42 @@
-# Status (2026-11-16, session 2)
+# Status (2026-11-16, session 3)
+
+## Session 3 summary
+
+Branch now: `ccr-6ec64c05-vm0g2d` (the merge `934fb41` of session 2 plus this session's
+commits). `mc_speedrun/` and `azalea/` side by side as before.
+
+Tested live (seed -613993438115203091, 60 TPS):
+
+- `--go` (wood→stone→iron) after the combat/mining merge: ok on peaceful (7163 ticks) and on
+  normal with permanent day (9329 ticks, no fight happened, no death).
+- `eat`, `hunt`, `lava` test stages: ok. `hunt` kills a cow and a pig and eats the beef.
+- `fight`: with a stone sword a zombie dies in 5 hits. The earlier "Killed after 0 hits"
+  results were test mobs summoned into a hillside (`~6 ~ ~`) that suffocated: the server's
+  HurtTime and health (RCON, see TESTING.md) showed it. Test summons now use `open_spot`
+  (solid ground, 3 blocks of air) in `run.rs`.
+- Kill detection (`combat::fight`): a mob that drops out of `mob()` counts as killed only
+  when its health is 0 or the entity is gone (before: whenever it was within 8 blocks).
+- Mining stages from `work/mining` ran for the first time, peaceful, after wood/stone/iron:
+  - `descend`: reached y -54 by a staircase, but in 34265 ticks (~28 min IGT): far too slow.
+    The water bucket failed (path to the water "stuck: no move in 100 ticks", 3 tries).
+  - `diamonds`: strip mining works but ~670 ticks per step (20 steps per 13–15k ticks); 60
+    steps, no diamond seen before the 25 min test limit. Cause NOT found yet (next: run
+    `--stage diamonds` with `RUST_LOG=speedrun_bot::mine=debug,speedrun_bot::dig=debug`).
+    740 pathfinder "No best node found" warnings in that run.
+  - `obsidian`, `portal` after mining: not reached.
+- Seen in a messy `fight` run (world left at midnight by an earlier test, bot joined with
+  5 hp): running away from a zombie and a spider at low hp died twice in a row; after the
+  respawn it has no sword and keeps away. Survival at low hp needs work (block in, pillar,
+  or fight when a spider is the chaser — it outruns us).
+
+Not tested yet: `crowd`, `die`, `obsidian`, fortress spawner walk (fixed in session 2),
+blazes onward. Note: peaceful has no blazes or endermen, so a full run needs easy or above.
+
+Next, in order:
+1. Speed of `descend`/`diamonds` (debug log above), water bucket filling.
+2. `obsidian` → `portal` → `survey`/`fortress` on one world.
+3. Survival at low hp at night (easy), `die` (respawn, resume).
+4. Blazes at the spawner, pearls, eyes, stronghold, dragon.
 
 ## Session 2 summary (lead)
 

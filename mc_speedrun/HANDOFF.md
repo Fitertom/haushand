@@ -13,7 +13,8 @@ and by game ticks (IGT).
 - The owner talks Russian. Code, comments, logs, commits: English. Comments say WHY.
 - The bot uses **Azalea** (Rust Minecraft bot library). Azalea upstream supports 26.2 at
   best, so this project carries **its own port of Azalea to 26.3** in `../azalea`
-  (a git repo, branch `mc26.3`, based on upstream `azalea-rs/azalea` main `0d38e0d`).
+  (in this repository next to `mc_speedrun/`; based on upstream `azalea-rs/azalea` main
+  `0d38e0d`, see the root `HANDOFF.md`).
   The bot depends on it by path: `azalea = { path = "../azalea/azalea" }`.
 - Rust **nightly** (Azalea needs it); `rust-toolchain.toml` says `nightly`. Built and tested
   with `rustc 1.102.0-nightly (2026-11-13)`.
@@ -23,7 +24,14 @@ and by game ticks (IGT).
 | Path | What |
 |---|---|
 | `src/main.rs` | Args (`--server host:port --name Bot --owner Nick --go --stage <name>`), event handler, chat commands (`!go`, `!stage x`, `!stop`, `!inv`, `!pos`), deadlock detector thread. |
-| `src/run.rs` | The run as stages: `wood`, `stone`, `iron` (+ test stages `walk`, `probe`, `place`, `crafttest`, `tps`, `stand`). Each stage is idempotent: a goal on the inventory. |
+| `src/run.rs` | The run as stages: `wood`, `stone`, `iron` (the `--go` run), then `descend`, `diamonds`, `obsidian`, `portal`, `survey`, `fortress` (run with `--stage a,b,c`). Test stages: `food`, `fight`, `crowd`, `eat`, `hunt`, `lava`, `die`, `guard`, `map`, `walk`, `pathto`, `probe`, `place`, `crafttest`, `tps`, `stand`. Each stage is idempotent: a goal on the inventory or the world. |
+| `src/click.rs` | Our own look (yaw/pitch sent with the tick's movement), raycast against outline shapes, `sees`, `use_item_on`: every click only on a face the eyes see, in reach. |
+| `src/dig.rs` | Our own block breaking: a seen face, progress by the game's rule, server-confirmed. |
+| `src/combat.rs` | Mobs near us (`mobs_near`, `mob`), `fight` (aim, charged hits, creeper/skeleton handling, kill = health 0 or entity gone), `defend` (fight or run), `hunt`, `goto_guarded` (every walk stops to fight). |
+| `src/survival.rs` | `tend`: escape hazards (lava, fire), defend, eat, get food; death → respawn → resume the stage. |
+| `src/mine.rs` | Underground: staircase down to y -54, strip mining for seen ores, obsidian cast from lava with buckets, portal room. Slow so far (see STATUS). |
+| `src/portal.rs` | Nether portal: site, frame (corners from cobblestone, 3-high pillar), light, enter. |
+| `src/nether.rs` | Fortress search (spiral of legs), walking in legs, blaze spawner search. |
 | `src/obtain.rs` | `obtain(items, n)`: get N of an item by mining (with the right pickaxe tier), smelting (furnace, fuel) or crafting (ingredients first, recursively). Hand-written source table — to be replaced by the planner in `knowledge.rs`. |
 | `src/craft.rs` | Crafting by clicking ingredients into the 2×2 or crafting-table grid; waits for the server's answer between clicks (`settle_menu`) and for the result to appear. Hand-written recipe list. |
 | `src/place.rs` | Placing a block by the real outline shapes (slabs, bamboo offsets, replaceable grass), checks it won't be inside the bot, aims and verifies the hit. |
