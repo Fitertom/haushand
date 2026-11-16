@@ -46,3 +46,15 @@ Everything here ran in a Linux cloud container (4 cores, 15 GB RAM).
   answer instead (menu state id stable, result slot filled, block changed).
 - A click on short grass replaces it: the placed block lands one lower. `place.rs` handles
   replaceable blocks.
+
+## Report
+
+`python3 tools/report.py runs/<file>.jsonl [-o out.html]` (no argument: newest log in `runs/`;
+output next to the log, `.html`). Python 3 stdlib only; the page is one offline file with
+light/dark mode. It shows: header (start, total IGT, real time, result, deaths), splits per
+stage (IGT and real time, ok/failed + error, and the best earlier ok split of the same stage
+from the other logs in the same folder), top-down path per dimension (equal x/z scale, colour
+= time, stage starts, deaths, start/end), y over time, hp/food with stage bands,
+advancements and a generic event list (unknown kinds are shown as-is). Truncated or empty
+logs are fine. A synthetic log with every kind (death, nether, unknown kinds, half-written
+last line) is in `tools/testdata/synthetic.jsonl` (rendered: `synthetic.html` beside it).
