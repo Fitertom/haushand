@@ -156,6 +156,9 @@ pub fn process_packet(ecs: &mut World, player: Entity, packet: &ClientboundGameP
             set_objective,
             set_passengers,
             set_player_team,
+            add_transient_block,
+            post_effects,
+            swing_animation,
             set_score,
             set_simulation_distance,
             set_subtitle_text,
@@ -436,7 +439,13 @@ impl GamePacketHandler<'_> {
             // send the relevant packets
             commands.trigger(SendGamePacketEvent::new(
                 self.player,
-                ServerboundAcceptTeleportation { id: p.id },
+                // since 26.3 the client says where the teleport put it
+                ServerboundAcceptTeleportation {
+                    id: p.id,
+                    pos: **position,
+                    y_rot: direction.y_rot(),
+                    x_rot: direction.x_rot(),
+                },
             ));
             commands.trigger(SendGamePacketEvent::new(
                 self.player,
@@ -1511,9 +1520,10 @@ impl GamePacketHandler<'_> {
                     return;
                 };
 
-                let new_position = p.values.pos;
+                // a stepped path is played over a few ticks; we jump to where it ends
+                let new_position = p.position.end_position();
                 let new_on_ground = p.on_ground;
-                let new_look_direction = p.values.look_direction;
+                let new_look_direction = LookDirection::new(p.y_rot, p.x_rot);
 
                 if !should_apply_entity_update(
                     &mut commands,
@@ -1562,6 +1572,9 @@ impl GamePacketHandler<'_> {
     pub fn set_display_objective(&mut self, _p: &ClientboundSetDisplayObjective) {}
     pub fn set_objective(&mut self, _p: &ClientboundSetObjective) {}
     pub fn set_passengers(&mut self, _p: &ClientboundSetPassengers) {}
+    pub fn add_transient_block(&mut self, _p: &ClientboundAddTransientBlock) {}
+    pub fn post_effects(&mut self, _p: &ClientboundPostEffects) {}
+    pub fn swing_animation(&mut self, _p: &ClientboundSwingAnimation) {}
     pub fn set_player_team(&mut self, p: &ClientboundSetPlayerTeam) {
         debug!("Got set player team packet {p:?}");
     }

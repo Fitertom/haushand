@@ -102,6 +102,7 @@ pub enum EntityDataValue {
     Quaternion(Quaternion),
     ResolvableProfile(components::Profile),
     HumanoidArm(HumanoidArm),
+    DyeColor(components::DyeColor),
 }
 
 const _: () = assert!(size_of::<EntityDataValue>() == 24);

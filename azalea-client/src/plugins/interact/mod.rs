@@ -27,7 +27,7 @@ use azalea_physics::{
 };
 use azalea_protocol::packets::game::{
     ServerboundInteract, ServerboundUseItem, s_interact::InteractionHand,
-    s_swing::ServerboundSwing, s_use_item_on::ServerboundUseItemOn,
+    s_punch::ServerboundPunch, s_use_item_on::ServerboundUseItemOn,
 };
 use azalea_world::World;
 use bevy_app::{App, Plugin, Update};
@@ -443,9 +443,9 @@ pub struct SwingArmEvent {
 pub fn handle_swing_arm_trigger(swing_arm: On<SwingArmEvent>, mut commands: Commands) {
     commands.trigger(SendGamePacketEvent::new(
         swing_arm.entity,
-        ServerboundSwing {
-            hand: InteractionHand::MainHand,
-        },
+        // 26.3 dropped the swing packet; a left click is a punch, and the server swings
+        // the arm for everyone else.
+        ServerboundPunch,
     ));
 }
 

@@ -3,7 +3,7 @@ use std::{
     ops::Add,
 };
 
-use azalea_buf::{AzBuf, BufReadError};
+use azalea_buf::{AzBuf, AzBufVar, BufReadError};
 use azalea_core::{bitset::FixedBitSet, math, position::Vec3};
 use azalea_entity::{LookDirection, Physics, Position};
 
@@ -156,4 +156,70 @@ impl AzBuf for MoveFlags {
         bitset.azalea_write(buf)?;
         Ok(())
     }
+}
+
+/// Where an entity went, since 26.3: straight to a point, or by steps each at its own tick.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PositionPath {
+    Linear(Vec3),
+    Stepped(Vec<PositionStep>),
+}
+#[derive(AzBuf, Clone, Debug, PartialEq)]
+pub struct PositionStep {
+    pub position: Vec3,
+    #[var]
+    pub tick_offset: i32,
+}
+impl PositionPath {
+    /// Where the path ends: the entity is there once the steps are played.
+    pub fn end_position(&self) -> Vec3 {
+        match self {
+            Self::Linear(p) => *p,
+            Self::Stepped(steps) => steps.last().map(|s| s.position).unwrap_or_default(),
+        }
+    }
+}
+impl AzBuf for PositionPath {
+    fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        Ok(match u32::azalea_read_var(buf)? {
+            0 => Self::Linear(Vec3::azalea_read(buf)?),
+            1 => Self::Stepped(Vec::<PositionStep>::azalea_read(buf)?),
+            other => {
+                return Err(BufReadError::UnexpectedEnumVariant { id: other as i32 });
+            }
+        })
+    }
+    fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
+        match self {
+            Self::Linear(p) => {
+                0u32.azalea_write_var(buf)?;
+                p.azalea_write(buf)
+            }
+            Self::Stepped(steps) => {
+                1u32.azalea_write_var(buf)?;
+                steps.azalea_write(buf)
+            }
+        }
+    }
+}
+
+/// A move entity packet's position change, since 26.3: either one delta, or a chain of
+/// steps each relative to the one before, read as the sum of the chain. The step count
+/// comes from the packet's properties, not from the delta itself.
+pub fn read_vec_delta(
+    buf: &mut Cursor<&[u8]>,
+    step_count: u32,
+) -> Result<azalea_core::delta::PositionDelta8, BufReadError> {
+    if step_count == 0 {
+        return azalea_core::delta::PositionDelta8::azalea_read(buf);
+    }
+    let (mut xa, mut ya, mut za) = (0i32, 0i32, 0i32);
+    for _ in 0..step_count {
+        let _ticks = u32::azalea_read_var(buf)?;
+        xa += i16::azalea_read(buf)? as i32;
+        ya += i16::azalea_read(buf)? as i32;
+        za += i16::azalea_read(buf)? as i32;
+    }
+    let clamp = |v: i32| v.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+    Ok(azalea_core::delta::PositionDelta8 { xa: clamp(xa), ya: clamp(ya), za: clamp(za) })
 }

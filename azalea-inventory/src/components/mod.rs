@@ -201,7 +201,10 @@ define_data_components!(
     MaxDamage,
     Damage,
     Unbreakable,
+    UseEffects,
     CustomName,
+    MinimumAttackCharge,
+    DamageType,
     ItemName,
     ItemModel,
     Lore,
@@ -223,6 +226,7 @@ define_data_components!(
     DamageResistant,
     Tool,
     Weapon,
+    AttackRange,
     Enchantable,
     Equippable,
     Repairable,
@@ -230,9 +234,16 @@ define_data_components!(
     TooltipStyle,
     DeathProtection,
     BlocksAttacks,
+    PiercingWeapon,
+    KineticWeapon,
+    AttackAnimation,
+    InteractAnimation,
+    AdditionalTradeCost,
+    BlockTransformer,
+    VillagerFood,
     StoredEnchantments,
+    Dye,
     DyedColor,
-    MapColor,
     MapId,
     MapDecorations,
     MapPostProcessing,
@@ -265,9 +276,14 @@ define_data_components!(
     Container,
     BlockState,
     Bees,
+    SulfurCubeContent,
     Lock,
     ContainerLoot,
     BreakSound,
+    Compostable,
+    CookingFuel,
+    BrewingFuel,
+    MobVisibility,
     VillagerVariant,
     WolfVariant,
     WolfSoundVariant,
@@ -281,32 +297,27 @@ define_data_components!(
     MooshroomVariant,
     RabbitVariant,
     PigVariant,
+    PigSoundVariant,
     CowVariant,
+    CowSoundVariant,
     ChickenVariant,
+    ChickenSoundVariant,
+    ZombieNautilusVariant,
     FrogVariant,
     HorseVariant,
     PaintingVariant,
     LlamaVariant,
     AxolotlVariant,
     CatVariant,
+    CatSoundVariant,
     CatCollar,
     SheepColor,
     ShulkerColor,
-    UseEffects,
-    MinimumAttackCharge,
-    DamageType,
-    PiercingWeapon,
-    KineticWeapon,
-    SwingAnimation,
-    ZombieNautilusVariant,
-    AttackRange,
-    AdditionalTradeCost,
-    Dye,
-    PigSoundVariant,
-    CowSoundVariant,
-    ChickenSoundVariant,
-    CatSoundVariant,
-    SulfurCubeContent,
+    ProvidesPotteryPattern,
+    SignTextFront,
+    SignTextBack,
+    Waxed,
+    CushionColor,
 );
 
 #[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
@@ -638,12 +649,6 @@ pub struct DyedColor {
 
 #[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
 #[serde(transparent)]
-pub struct MapColor {
-    pub color: i32,
-}
-
-#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
-#[serde(transparent)]
 pub struct MapId {
     #[var]
     pub id: i32,
@@ -870,9 +875,10 @@ pub struct BannerPatterns {
     pub patterns: Vec<BannerPatternLayer>,
 }
 
-#[derive(AzBuf, Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(AzBuf, Clone, Copy, Debug, Default, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DyeColor {
+    #[default]
     White,
     Orange,
     Magenta,
@@ -897,10 +903,29 @@ pub struct BaseColor {
     pub color: DyeColor,
 }
 
-#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
-#[serde(transparent)]
+/// The four sides of a decorated pot. Since 26.3 each side is an item template, not just
+/// an item kind.
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize, Default)]
 pub struct PotDecorations {
-    pub items: Vec<ItemKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub back: Option<ItemStackTemplate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<ItemStackTemplate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<ItemStackTemplate>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub front: Option<ItemStackTemplate>,
+}
+
+/// An item, a count and a component patch: what 26.3 keeps where it used to keep an item
+/// kind. On the wire the item comes first, unlike in an `ItemStack`.
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+pub struct ItemStackTemplate {
+    #[serde(rename = "id")]
+    pub kind: ItemKind,
+    #[var]
+    pub count: i32,
+    pub components: crate::DataComponentPatch,
 }
 
 #[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
@@ -1832,13 +1857,13 @@ impl Default for KineticWeaponCondition {
 }
 
 #[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
-pub struct SwingAnimation {
+pub struct AttackAnimation {
     #[serde(rename = "type")]
     pub kind: SwingAnimationKind,
     #[var]
     pub duration: i32,
 }
-impl SwingAnimation {
+impl AttackAnimation {
     pub const fn new() -> Self {
         Self {
             kind: SwingAnimationKind::Whack,
@@ -1846,7 +1871,7 @@ impl SwingAnimation {
         }
     }
 }
-impl Default for SwingAnimation {
+impl Default for AttackAnimation {
     fn default() -> Self {
         Self::new()
     }
@@ -1928,4 +1953,131 @@ pub struct CatSoundVariant {
 #[serde(transparent)]
 pub struct SulfurCubeContent {
     pub absorbed_block_item_stack: ItemStack,
+}
+
+/// The same as [`AttackAnimation`]: the swing played when the item is used on something.
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+pub struct InteractAnimation {
+    #[serde(rename = "type")]
+    pub kind: SwingAnimationKind,
+    #[var]
+    pub duration: i32,
+}
+impl InteractAnimation {
+    pub const fn new() -> Self {
+        Self {
+            kind: SwingAnimationKind::Whack,
+            duration: 6,
+        }
+    }
+}
+impl Default for InteractAnimation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A holder of the `block_transformer` registry, sent by its id.
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct BlockTransformer {
+    #[var]
+    pub id: u32,
+}
+
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+pub struct VillagerFood {
+    #[var]
+    pub nutrition: i32,
+}
+
+/// A number given outright or by a key of a context provider registry
+/// (`ResolvableInt` / `ResolvableFloat`): on the wire a bool (true: the constant) and then
+/// the value.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum Resolvable<T> {
+    Constant(T),
+    Reference(Identifier),
+}
+impl<T: AzBuf> AzBuf for Resolvable<T> {
+    fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        Ok(if bool::azalea_read(buf)? {
+            Self::Constant(T::azalea_read(buf)?)
+        } else {
+            Self::Reference(Identifier::azalea_read(buf)?)
+        })
+    }
+    fn azalea_write(&self, buf: &mut impl io::Write) -> io::Result<()> {
+        match self {
+            Self::Constant(v) => {
+                true.azalea_write(buf)?;
+                v.azalea_write(buf)
+            }
+            Self::Reference(id) => {
+                false.azalea_write(buf)?;
+                id.azalea_write(buf)
+            }
+        }
+    }
+}
+
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+pub struct Compostable {
+    pub layers: Resolvable<i32>,
+}
+
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+pub struct CookingFuel {
+    pub burn_time: Resolvable<i32>,
+    pub speed_multiplier: Resolvable<f32>,
+}
+
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+pub struct BrewingFuel {
+    pub uses: Resolvable<i32>,
+    pub speed_multiplier: Resolvable<f32>,
+}
+
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+pub struct MobVisibility {
+    pub targeting_entity_types: HolderSet<EntityKind, Identifier>,
+    pub visibility: f32,
+}
+
+/// A holder of the `decorated_pot_pattern` registry, sent by its id.
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct ProvidesPotteryPattern {
+    #[var]
+    pub id: u32,
+}
+
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+pub struct SignText {
+    pub messages: [FormattedText; 4],
+    pub filtered_messages: Option<[FormattedText; 4]>,
+    pub color: DyeColor,
+    pub has_glowing_text: bool,
+}
+
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct SignTextFront {
+    pub text: SignText,
+}
+
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct SignTextBack {
+    pub text: SignText,
+}
+
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+pub struct Waxed;
+
+#[derive(AzBuf, Clone, Debug, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct CushionColor {
+    pub color: DyeColor,
 }

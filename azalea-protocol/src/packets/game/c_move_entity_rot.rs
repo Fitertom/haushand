@@ -8,6 +8,7 @@ use crate::packets::game::c_move_entity_pos_rot::CompactLookDirection;
 pub struct ClientboundMoveEntityRot {
     #[var]
     pub entity_id: MinecraftEntityId,
-    pub look_direction: CompactLookDirection,
+    /// Before the rotation since 26.3.
     pub on_ground: bool,
+    pub look_direction: CompactLookDirection,
 }

@@ -5,7 +5,7 @@ use std::{
 
 use azalea_buf::AzBuf;
 use azalea_chat::FormattedText;
-use azalea_inventory::ItemStack;
+use azalea_inventory::components::ItemStackTemplate;
 use azalea_protocol_macros::ClientboundGamePacket;
 use azalea_registry::identifier::Identifier;
 use indexmap::IndexMap;
@@ -13,7 +13,7 @@ use indexmap::IndexMap;
 #[derive(AzBuf, ClientboundGamePacket, Clone, Debug, PartialEq)]
 pub struct ClientboundUpdateAdvancements {
     pub reset: bool,
-    pub added: Vec<AdvancementHolder>,
+    pub added: Vec<PositionedAdvancement>,
     pub removed: Vec<Identifier>,
     pub progress: IndexMap<Identifier, AdvancementProgress>,
     pub show_advancements: bool,
@@ -31,13 +31,11 @@ pub struct Advancement {
 pub struct DisplayInfo {
     pub title: FormattedText,
     pub description: FormattedText,
-    pub icon: ItemStack,
+    pub icon: ItemStackTemplate,
     pub frame: FrameType,
     pub show_toast: bool,
     pub hidden: bool,
     pub background: Option<Identifier>,
-    pub x: f32,
-    pub y: f32,
 }
 
 impl AzBuf for DisplayInfo {
@@ -57,8 +55,6 @@ impl AzBuf for DisplayInfo {
         } else {
             None
         };
-        let x = AzBuf::azalea_read(buf)?;
-        let y = AzBuf::azalea_read(buf)?;
         Ok(DisplayInfo {
             title,
             description,
@@ -67,8 +63,6 @@ impl AzBuf for DisplayInfo {
             show_toast,
             hidden,
             background,
-            x,
-            y,
         })
     }
     fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
@@ -92,8 +86,6 @@ impl AzBuf for DisplayInfo {
         if let Some(background) = &self.background {
             background.azalea_write(buf)?;
         }
-        self.x.azalea_write(buf)?;
-        self.y.azalea_write(buf)?;
         Ok(())
     }
 }
@@ -112,6 +104,15 @@ pub struct CriterionProgress {
     pub date: Option<u64>,
 }
 
+/// An advancement and where it sits on its tab: since 26.3 the place is sent beside the
+/// advancement, not inside its display.
+#[derive(AzBuf, Clone, Debug, PartialEq)]
+pub struct PositionedAdvancement {
+    pub advancement: AdvancementHolder,
+    pub x: f32,
+    pub y: f32,
+}
+
 #[derive(AzBuf, Clone, Debug, PartialEq)]
 pub struct AdvancementHolder {
     pub id: Identifier,
@@ -128,25 +129,23 @@ mod tests {
     fn test() {
         let packet = ClientboundUpdateAdvancements {
             reset: true,
-            added: [AdvancementHolder {
+            added: [PositionedAdvancement { x: 0.0, y: 0.0, advancement: AdvancementHolder {
                 id: Identifier::new("minecraft:test"),
                 value: Advancement {
                     parent_id: None,
                     display: Some(Box::new(DisplayInfo {
                         title: FormattedText::from("title".to_owned()),
                         description: FormattedText::from("description".to_owned()),
-                        icon: ItemStack::Empty,
+                        icon: ItemStackTemplate { kind: azalea_registry::builtin::ItemKind::Stone, count: 1, components: Default::default() },
                         frame: FrameType::Task,
                         show_toast: true,
                         hidden: false,
                         background: None,
-                        x: 0.0,
-                        y: 0.0,
                     })),
                     requirements: Vec::new(),
                     sends_telemetry_event: false,
                 },
-            }]
+            }}]
             .into_iter()
             .collect(),
             removed: vec![Identifier::new("minecraft:test2")],
@@ -178,8 +177,8 @@ mod tests {
             .added
             .into_iter()
             .find_map(|a| {
-                if a.id == Identifier::new("minecraft:test") {
-                    Some(a.value)
+                if a.advancement.id == Identifier::new("minecraft:test") {
+                    Some(a.advancement.value)
                 } else {
                     None
                 }
@@ -190,8 +189,8 @@ mod tests {
             .added
             .into_iter()
             .find_map(|a| {
-                if a.id == Identifier::new("minecraft:test") {
-                    Some(a.value)
+                if a.advancement.id == Identifier::new("minecraft:test") {
+                    Some(a.advancement.value)
                 } else {
                     None
                 }

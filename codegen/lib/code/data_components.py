@@ -543,8 +543,20 @@ use crate::{
 
         item_defaults_original = item_defaults
         item_defaults = {}
+        # Registry holders sent by id: the report names them by key, the id is the
+        # server's, so there is no default to write here.
+        if component_resource_id in {"block_transformer", "provides_pottery_pattern", "compostable", "cooking_fuel", "brewing_fuel"}:
+            continue
+        failed = False
         for k, v in sorted(item_defaults_original.items(), key=lambda i: i[0]):
-            item_defaults[k] = python_to_rust_value(v, field_type)
+            try:
+                item_defaults[k] = python_to_rust_value(v, field_type)
+            except Exception as e:
+                print(f"SKIP default of {component_resource_id} for {k}: {v!r} ({e!r})")
+                failed = True
+                break
+        if failed:
+            continue
 
         default_values_frequency = {}
         for value in sorted(item_defaults.values()):

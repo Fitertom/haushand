@@ -57,6 +57,7 @@ pub fn process_packet(ecs: &mut World, player: Entity, packet: &ClientboundConfi
             custom_report_details,
             server_links,
             clear_dialog,
+            post_effects,
             show_dialog,
             code_of_conduct,
         ]
@@ -229,6 +230,7 @@ impl ConfigPacketHandler<'_> {
         debug!("Got custom report details packet {p:?}");
     }
 
+    pub fn post_effects(&mut self, _p: &ClientboundPostEffects) {}
     pub fn clear_dialog(&mut self, p: &ClientboundClearDialog) {
         debug!("Got clear dialog packet {p:?}");
     }

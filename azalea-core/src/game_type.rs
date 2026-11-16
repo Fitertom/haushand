@@ -110,7 +110,7 @@ impl AzBuf for GameMode {
         }))
     }
     fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
-        u8::azalea_write(&self.to_id(), buf)
+        (self.to_id() as u32).azalea_write_var(buf)
     }
 }
 
@@ -131,12 +131,22 @@ impl From<OptionalGameType> for Option<GameMode> {
     }
 }
 
+/// Since 26.3 an optional VarInt: 0 for none, else the game mode's id plus one (before, a
+/// byte with -1 for none).
 impl AzBuf for OptionalGameType {
     fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
-        let id = i8::azalea_read(buf)?;
-        GameMode::from_optional_id(id).ok_or(BufReadError::UnexpectedEnumVariant { id: id as i32 })
+        let id = u32::azalea_read_var(buf)?;
+        if id == 0 {
+            return Ok(OptionalGameType(None));
+        }
+        let mode = u8::try_from(id - 1).ok().and_then(GameMode::from_id);
+        mode.map(|m| OptionalGameType(Some(m)))
+            .ok_or(BufReadError::UnexpectedEnumVariant { id: id as i32 })
     }
     fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
-        GameMode::to_optional_id(*self).azalea_write(buf)
+        match self.0 {
+            None => 0u32.azalea_write_var(buf),
+            Some(mode) => (mode.to_id() as u32 + 1).azalea_write_var(buf),
+        }
     }
 }
