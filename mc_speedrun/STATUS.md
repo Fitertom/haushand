@@ -20,8 +20,10 @@ Tested only in **peaceful, permanent day** (set via RCON) — no combat yet.
 
 ## In progress when handed off
 
-- A full timed run `--go` (wood→stone→iron) on a fresh world with telemetry was started; its
-  result was not read. Rerun it (TESTING.md).
+- A full timed run `--go` on a fresh world (seed -613993438115203091) failed in `wood`: the
+  crafting table was made after the pickaxe's planks and ate them. Fixed in `obtain.rs`
+  (table first) but NOT re-run yet — rerun `--go` on a fresh world first (TESTING.md).
+  Telemetry of that run worked (`runs/*.jsonl`: stages, `story/root` at tick 3812).
 
 ## Next, in order
 
