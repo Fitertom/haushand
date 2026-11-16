@@ -1,9 +1,6 @@
-use azalea_client::interact::{
-    BlockStatePredictionHandler, EntityInteractEvent, StartUseItemEvent, pick::HitResultComponent,
-};
+use azalea_client::interact::{EntityInteractEvent, StartUseItemEvent, pick::HitResultComponent};
 use azalea_core::{hit_result::HitResult, position::BlockPos};
-use azalea_entity::LookDirection;
-use azalea_protocol::packets::game::{s_interact::InteractionHand, s_use_item::ServerboundUseItem};
+use azalea_protocol::packets::game::s_interact::InteractionHand;
 use bevy_ecs::entity::Entity;
 
 use crate::{Client, client_impl::error::AzaleaResult};
@@ -57,35 +54,5 @@ impl Client {
             hand: InteractionHand::MainHand,
             force_block: None,
         });
-    }
-
-    /// Use the held item "in the air" (`ServerboundUseItem`) facing `direction`,
-    /// whatever block is in the crosshair.
-    ///
-    /// [`Client::start_use_item`] sends only `ServerboundUseItemOn` when a
-    /// block is in view, and relies on the server's answer to that; the
-    /// vanilla client also sends `UseItem` when the block interaction passed.
-    /// Items that raycast themselves (buckets, ender eyes, boats) only act on
-    /// `UseItem`, so they need this. The server takes the rotation from the
-    /// packet, so no separate look is needed first.
-    pub fn use_item_facing(&self, direction: LookDirection) -> AzaleaResult<()> {
-        let seq = {
-            let mut ecs = self.ecs.write();
-            let mut handler = ecs
-                .get_mut::<BlockStatePredictionHandler>(self.entity)
-                .ok_or(crate::client_impl::error::MissingComponentError {
-                    entity_description: "Client",
-                    entity: self.entity,
-                    component: "BlockStatePredictionHandler",
-                })?;
-            handler.start_predicting()
-        };
-        self.write_packet(ServerboundUseItem {
-            hand: InteractionHand::MainHand,
-            seq,
-            y_rot: direction.y_rot(),
-            x_rot: direction.x_rot(),
-        });
-        Ok(())
     }
 }

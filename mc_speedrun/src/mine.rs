@@ -15,6 +15,7 @@ use azalea::{
     block::{BlockState, fluid_state::{FluidKind, FluidState}},
     core::direction::Direction,
     entity::LookDirection,
+    interact::BlockStatePredictionHandler,
     pathfinder::{
         PathfinderOpts,
         goals::{BlockPosGoal, Goal, RadiusGoal, ReachBlockPosGoal},
@@ -22,12 +23,14 @@ use azalea::{
     },
     physics::{clip::{BlockShapeType, ClipContext, FluidPickType, clip}, collision::BlockWithShape},
     prelude::*,
+    protocol::packets::game::{s_interact::InteractionHand, s_use_item::ServerboundUseItem},
     registry::builtin::{BlockKind, ItemKind},
 };
 use eyre::{Result, bail, eyre};
 use tracing::{debug, info, warn};
 
 use crate::{
+    click::{self, REACH},
     craft::{self, items},
     inv::{self, Items},
     place,
@@ -44,9 +47,6 @@ pub const DIAMOND_Y: i32 = -54;
 /// How far a seen ore may be for a detour to it (blocks).
 const ORE_RADIUS: i32 = 12;
 
-const EYE: f64 = 1.62;
-/// The player's block interaction range.
-const REACH: f64 = 4.5;
 
 const SIDES: [BlockPos; 4] =
     [BlockPos { x: 1, y: 0, z: 0 }, BlockPos { x: -1, y: 0, z: 0 }, BlockPos { x: 0, y: 0, z: 1 }, BlockPos { x: 0, y: 0, z: -1 }];
@@ -124,7 +124,7 @@ fn liquid_next_to(bot: &Client, pos: BlockPos, below_ok: bool) -> Option<(BlockP
 }
 
 fn eye(bot: &Client) -> Vec3 {
-    me(bot) + Vec3::new(0.0, EYE, 0.0)
+    click::eye(bot)
 }
 
 /// Where a ray from our eyes towards `to` stops, as the server traces it for a bucket
@@ -198,8 +198,7 @@ pub async fn dig(bot: &Client, pos: BlockPos, below_ok: bool) -> Result<()> {
         // aim at the nearest point of the block that is in view: its middle may be hidden
         // behind the edge of the tunnel
         let Some(aim) = aim_point(bot, pos) else { bail!("{pos} not in view") };
-        bot.look_at(aim);
-        bot.wait_ticks(1).await;
+        click::look(bot, aim).await;
         let falls_in = is_falling(block_at(bot, pos + UP));
         match tokio::time::timeout(Duration::from_secs(60), bot.mine_with_auto_tool(pos)).await {
             Ok(r) => r?,
@@ -679,36 +678,91 @@ fn buckets(bot: &Client) -> (i32, i32, i32) {
     (inv::count_kind(bot, ItemKind::Bucket), inv::count_kind(bot, ItemKind::WaterBucket), inv::count_kind(bot, ItemKind::LavaBucket))
 }
 
-/// Uses the bucket in hand towards `target` and waits until the inventory shows the
-/// change. `fluids` is the server's trace: SourceOnly fills, None empties.
-async fn use_bucket(bot: &Client, hold: ItemKind, target: Vec3, expect: ItemKind) -> Result<()> {
-    if !inv::hold(bot, &Items::one(hold)).await {
-        bail!("no {hold:?} to use");
-    }
-    let before = inv::count_kind(bot, expect);
-    // stand still: the server traces from where it has us
-    bot.walk(azalea::WalkDirection::None);
-    bot.look_at(target);
-    bot.wait_ticks(2).await;
-    let dir = azalea::bot::direction_looking_at(eye(bot), target);
-    bot.use_item_facing(dir)?;
-    for _ in 0..30 {
-        bot.wait_ticks(1).await;
-        if inv::count_kind(bot, expect) > before {
-            return Ok(());
-        }
-    }
-    bail!("{hold:?} towards {target} did not give {expect:?}")
+/// The unit vector of a look, as the server computes it from yaw and pitch
+/// (`Entity.calculateViewVector`), so our trace follows the same line as its.
+fn view_vector(yaw: f32, pitch: f32) -> Vec3 {
+    let p = pitch.to_radians();
+    let y = -yaw.to_radians();
+    Vec3::new((y.sin() * p.cos()) as f64, (-p.sin()) as f64, (y.cos() * p.cos()) as f64)
 }
 
-/// Fills a bucket from the water source `pos` (in reach and in view).
-async fn fill_water(bot: &Client, pos: BlockPos) -> Result<()> {
-    let target = pos.center() + Vec3::new(0.0, 0.3, 0.0);
-    let hit = trace(bot, target, FluidPickType::SourceOnly);
-    if hit.miss || hit.block_pos != pos {
-        bail!("water at {pos} not in view (trace hits {})", hit.block_pos);
+/// The server's trace for an item used "in the air": from our eyes along the look, as far
+/// as the block interaction range.
+fn trace_look(bot: &Client, yaw: f32, pitch: f32, fluids: FluidPickType) -> azalea::core::hit_result::BlockHitResult {
+    let from = eye(bot);
+    let end = from + view_vector(yaw, pitch) * REACH;
+    let w = world_lock(bot);
+    let w = w.read();
+    clip(&w.chunks, ClipContext { from, to: end, block_shape_type: BlockShapeType::Outline, fluid_pick_type: fluids })
+}
+
+/// A bucket use: what the server's trace must hit, and the cell it changes.
+#[derive(Clone, Copy, Debug)]
+struct BucketUse {
+    /// The bucket held: an empty one fills, a full one pours.
+    hold: ItemKind,
+    /// Where to look.
+    aim: Vec3,
+    /// The block the server's trace must stop at (a fluid source to fill from, or the
+    /// block whose face the fluid is poured against).
+    hit: BlockPos,
+    /// For a pour: the face of `hit` that must be hit; the fluid lands in front of it.
+    face: Option<Direction>,
+    /// The cell that changes, and the fluid in it afterwards (Empty for a fill).
+    cell: BlockPos,
+    after: FluidKind,
+}
+
+/// Uses a bucket. Buckets act on `ServerboundUseItem`: the server traces from our eyes
+/// along the look the packet carries, so the look is set first (ours, see `click::look`),
+/// the same trace is run here and must hit what was meant, and the result is checked by
+/// the block update and the inventory.
+async fn use_bucket(bot: &Client, u: BucketUse) -> Result<()> {
+    if !inv::hold(bot, &Items::one(u.hold)).await {
+        bail!("no {:?} to use", u.hold);
     }
-    use_bucket(bot, ItemKind::Bucket, target, ItemKind::WaterBucket).await
+    let before = inv::count_kind(bot, u.hold);
+    // stand still: the server traces from where it has us
+    bot.walk(azalea::WalkDirection::None);
+    click::look(bot, u.aim).await;
+    let (yaw, pitch) = click::angles(eye(bot), u.aim);
+    let fluids = if u.hold == ItemKind::Bucket { FluidPickType::SourceOnly } else { FluidPickType::None };
+    let hit = trace_look(bot, yaw, pitch, fluids);
+    if hit.miss || hit.block_pos != u.hit || u.face.is_some_and(|f| f != hit.direction) {
+        bail!("{:?} aimed at {} would hit {} {:?} (miss {})", u.hold, u.hit, hit.block_pos, hit.direction, hit.miss);
+    }
+    let seq = {
+        let mut ecs = bot.ecs.write();
+        ecs.get_mut::<BlockStatePredictionHandler>(bot.entity).map(|mut h| h.start_predicting()).unwrap_or(1)
+    };
+    bot.write_packet(ServerboundUseItem { hand: InteractionHand::MainHand, seq, y_rot: yaw, x_rot: pitch });
+    let done = |bot: &Client| {
+        // a fill is told by the bucket alone: a source in a lake fills again from the
+        // sources around it at once
+        let cell_ok = u.after == FluidKind::Empty || fluid(block_at(bot, u.cell)) == u.after;
+        cell_ok && inv::count_kind(bot, u.hold) < before
+    };
+    if wait_for(bot, 40, done).await {
+        return Ok(());
+    }
+    bail!("{:?} at {} did not change {} to {:?} (now {:?})", u.hold, u.hit, u.cell, u.after, BlockKind::from(block_at(bot, u.cell)))
+}
+
+/// Fills a bucket from the source `pos` (in reach and in view).
+async fn fill(bot: &Client, pos: BlockPos) -> Result<()> {
+    // aim at the fluid's upper part: a source is 8/9 high, the trace stops at its top
+    for dy in [0.3, 0.0, 0.4] {
+        let aim = pos.center() + Vec3::new(0.0, dy, 0.0);
+        let hit = trace(bot, aim, FluidPickType::SourceOnly);
+        if !hit.miss && hit.block_pos == pos {
+            return use_bucket(bot, BucketUse { hold: ItemKind::Bucket, aim, hit: pos, face: None, cell: pos, after: FluidKind::Empty }).await;
+        }
+    }
+    bail!("source at {pos} not in view")
+}
+
+async fn fill_water(bot: &Client, pos: BlockPos) -> Result<()> {
+    fill(bot, pos).await
 }
 
 /// Have a water bucket: fill one from the nearest water source in the open (a lake, a
@@ -841,7 +895,7 @@ async fn cast_one(bot: &Client, st: &Station, lava_avoid: BlockPos) -> Result<()
     // 1. lava
     if inv::count_kind(bot, ItemKind::LavaBucket) == 0 {
         let Some(&lava) = lava_in_reach(bot, lava_avoid).first() else { bail!("no lava source in reach") };
-        use_bucket(bot, ItemKind::Bucket, lava.center() + Vec3::new(0.0, 0.3, 0.0), ItemKind::LavaBucket).await?;
+        fill(bot, lava).await?;
     }
     // 2. into the hole: aim at its bottom; a full bucket's trace ignores liquids and puts
     // the lava in the cell before the face hit
@@ -849,27 +903,18 @@ async fn cast_one(bot: &Client, st: &Station, lava_avoid: BlockPos) -> Result<()
         bail!("cast hole {} not empty: {:?}", st.hole, BlockKind::from(block_at(bot, st.hole)));
     }
     let bottom = st.hole.center() + Vec3::new(0.0, -0.49, 0.0);
-    let hit = trace(bot, bottom, FluidPickType::None);
-    if hit.miss || hit.block_pos != st.hole + DOWN || hit.direction != Direction::Up {
-        bail!("hole bottom not in view: trace hits {} {:?}", hit.block_pos, hit.direction);
-    }
-    use_bucket(bot, ItemKind::LavaBucket, bottom, ItemKind::Bucket).await?;
+    use_bucket(bot, BucketUse { hold: ItemKind::LavaBucket, aim: bottom, hit: st.hole + DOWN, face: Some(Direction::Up), cell: st.hole, after: FluidKind::Lava }).await?;
     wait_for(bot, 20, |bot| is_source(block_at(bot, st.hole), FluidKind::Lava)).await;
     // 3. water against the wall's face, into the cell over the hole
     let side = st.wall - n;
-    let face = n.center() + Vec3::new(side.x as f64 * 0.49, -0.2, side.z as f64 * 0.49);
-    let hit = trace(bot, face, FluidPickType::None);
-    if hit.miss || hit.block_pos != st.wall || hit.direction != face_towards(n - st.wall) {
-        bail!("wall face not in view: trace hits {} {:?}", hit.block_pos, hit.direction);
-    }
-    let r = use_bucket(bot, ItemKind::WaterBucket, face, ItemKind::Bucket).await;
+    let face = n.center() + Vec3::new(side.x as f64 * 0.5, -0.2, side.z as f64 * 0.5);
+    let r = use_bucket(bot, BucketUse { hold: ItemKind::WaterBucket, aim: face, hit: st.wall, face: Some(face_towards(n - st.wall)), cell: n, after: FluidKind::Water }).await;
     // 4. take the water back at once, whatever happened: spread, it would reach the lava
     // we fill from and turn that to obsidian too (over lava, where a drop burns)
     let water_back = async {
         for _ in 0..3 {
             if is_source(block_at(bot, n), FluidKind::Water) {
-                let t = n.center() + Vec3::new(0.0, -0.1, 0.0);
-                if use_bucket(bot, ItemKind::Bucket, t, ItemKind::WaterBucket).await.is_ok() {
+                if fill(bot, n).await.is_ok() {
                     return true;
                 }
             } else if inv::count_kind(bot, ItemKind::WaterBucket) > 0 {
