@@ -13,6 +13,32 @@ use crate::{
 
 pub const STAGES: &[&str] = &["wood", "stone", "iron"];
 
+/// A free spot about `dist` blocks from us for a test summon: solid ground, feet and head
+/// in air (a mob summoned into a hillside suffocates, which looks like a fight won).
+fn open_spot(bot: &Client, dist: i32, skip: usize) -> String {
+    use azalea::{BlockPos, physics::collision::BlockWithShape};
+    let f = crate::world::feet(bot);
+    let mut found = Vec::new();
+    for (dx, dz) in [(dist, 0), (-dist, 0), (0, dist), (0, -dist), (dist, dist), (-dist, dist), (dist, -dist), (-dist, -dist)] {
+        for dy in [0, 1, -1, 2, -2, 3, -3] {
+            let p = BlockPos::new(f.x + dx, f.y + dy, f.z + dz);
+            let below = crate::world::block_at(bot, p.down(1));
+            if below.is_collision_shape_full()
+                && crate::world::block_at(bot, p).is_air()
+                && crate::world::block_at(bot, p.up(1)).is_air()
+                && crate::world::block_at(bot, p.up(2)).is_air()
+            {
+                found.push(p);
+                break;
+            }
+        }
+    }
+    match found.get(skip % found.len().max(1)) {
+        Some(p) => format!("{} {} {}", p.x, p.y, p.z),
+        None => format!("~{dist} ~ ~"),
+    }
+}
+
 pub async fn all(bot: &Client) -> Result<()> {
     for s in STAGES {
         stage(bot, s).await?;
@@ -211,7 +237,7 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
                 bot.chat("/give @s stone_sword");
             }
             for kind in ["zombie", "skeleton", "spider", "creeper", "husk", "enderman"] {
-                bot.chat(format!("/summon minecraft:{kind} ~6 ~ ~{}", if kind == "enderman" { " {AngerTime:600}" } else { "" }));
+                bot.chat(format!("/summon minecraft:{kind} {}{}", open_spot(bot, 6, 0), if kind == "enderman" { " {AngerTime:600}" } else { "" }));
                 bot.wait_ticks(20).await;
                 let hp = crate::combat::health(bot);
                 let t0 = std::time::Instant::now();
@@ -224,8 +250,8 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
         // `fightn <n>`-like: several zombies at once.
         "crowd" => {
             bot.chat("/time set midnight");
-            for dx in [5, -5, 0] {
-                bot.chat(format!("/summon minecraft:zombie ~{dx} ~ ~5"));
+            for i in 0..3 {
+                bot.chat(format!("/summon minecraft:zombie {}", open_spot(bot, 5, i)));
             }
             bot.wait_ticks(20).await;
             let n = test_fight(bot).await?;
@@ -252,8 +278,8 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
             bot.chat("/clear @s");
             bot.chat("/give @s stone_sword");
             bot.chat("/time set day");
-            bot.chat("/summon minecraft:cow ~8 ~ ~3");
-            bot.chat("/summon minecraft:pig ~-6 ~ ~6");
+            bot.chat(format!("/summon minecraft:cow {}", open_spot(bot, 8, 0)));
+            bot.chat(format!("/summon minecraft:pig {}", open_spot(bot, 6, 1)));
             bot.chat("/effect give @s hunger 60 200");
             for _ in 0..600 {
                 if crate::survival::food_level(bot) <= 12 { break }

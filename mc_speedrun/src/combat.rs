@@ -536,7 +536,7 @@ pub fn strike(bot: &Client, target: Entity) -> bool {
         debug!("not hitting {:?}: not in the crosshair (box {:.2} away)", m.kind, m.box_distance(eye));
         return false;
     };
-    info!("strike {:?} with {:?} (mob hp {:.1}, hp {:.0})", m.kind, held(bot), m.health, health(bot));
+    debug!("strike {:?} with {:?} (mob hp {:.1}, hp {:.0})", m.kind, held(bot), m.health, health(bot));
     bot.write_packet(ServerboundAttack { entity_id: m.id });
     bot.write_packet(ServerboundPunch);
     CHARGE_START.store(bot.ticks_connected(), Ordering::Relaxed);
@@ -587,7 +587,7 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
             // 0) or the entity is gone. Out of view while still alive: not a kill.
             let hp_now = bot.ecs.read().get::<metadata::Health>(target).map(|h| h.0);
             let dead = !exists || hp_now.is_none_or(|h| h <= 0.0);
-            info!("fight: {last_kind:?} health now {hp_now:?}");
+            debug!("fight: {last_kind:?} health now {hp_now:?}");
             break if dead && last_pos.distance_to(crate::world::me(bot)) < 8.0 { Outcome::Killed } else { Outcome::Gone };
         };
         last_kind = m.kind;
@@ -602,7 +602,7 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
         let toward = flat * (1.0 / flat_d);
 
         if (m.health - last_logged_health).abs() > 0.05 {
-            info!("fight {:?}: health {:.1} (hits {hits}, want_hit {want_hit})", m.kind, m.health);
+            debug!("fight {:?} #{}: health {:.1} at {:.1} {:.1} {:.1} (hits {hits}, want_hit {want_hit})", m.kind, m.id.0, m.health, m.pos.x, m.pos.y, m.pos.z);
             last_logged_health = m.health;
         }
         if m.health < best.0 - 0.1 || dist < best.1 - 0.5 {
