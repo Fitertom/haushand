@@ -398,16 +398,103 @@ pub fn face(bot: &Client, target: Vec3) {
     aim(bot, Vec3::new(target.x, eye.y, target.z));
 }
 
+/// The player's `entity_interaction_range`: the client's crosshair picks an entity only
+/// this far from the eyes, and so does ours.
+const ENTITY_RANGE: f64 = 3.0;
+
+/// Unit vector of a look, in Minecraft's yaw/pitch convention (the inverse of
+/// `click::angles`).
+pub fn look_vector(yaw: f32, pitch: f32) -> Vec3 {
+    let (y, p) = ((yaw as f64).to_radians(), (pitch as f64).to_radians());
+    Vec3::new(-y.sin() * p.cos(), -p.sin(), y.cos() * p.cos())
+}
+
+/// Where a ray from `from` (unit `dir`) enters `m`'s box; 0 when it starts inside.
+fn ray_into(from: Vec3, dir: Vec3, m: &Mob) -> Option<f64> {
+    let r = m.width / 2.0;
+    let (lo, hi) = (Vec3::new(m.pos.x - r, m.pos.y, m.pos.z - r), Vec3::new(m.pos.x + r, m.pos.y + m.height, m.pos.z + r));
+    let mut t0 = 0.0f64;
+    let mut t1 = f64::INFINITY;
+    for (o, d, a, b) in [(from.x, dir.x, lo.x, hi.x), (from.y, dir.y, lo.y, hi.y), (from.z, dir.z, lo.z, hi.z)] {
+        if d.abs() < 1e-12 {
+            if o < a || o > b {
+                return None;
+            }
+            continue;
+        }
+        let (u, v) = ((a - o) / d, (b - o) / d);
+        t0 = t0.max(u.min(v));
+        t1 = t1.min(u.max(v));
+    }
+    (t0 <= t1).then_some(t0)
+}
+
+/// What a crosshair along `dir` from our eyes would pick, as the client's pick does it:
+/// the nearest entity box the ray enters within the entity range, unless a block's outline
+/// (grass and flowers included, as in the game) comes first. `others` are the mobs that
+/// could be in the way. Returns the distance when it is `m`.
+fn picks(bot: &Client, eye: Vec3, dir: Vec3, m: &Mob, others: &[Mob]) -> Option<f64> {
+    let t = ray_into(eye, dir, m).filter(|t| *t <= ENTITY_RANGE)?;
+    if others.iter().any(|o| o.entity != m.entity && ray_into(eye, dir, o).is_some_and(|u| u < t)) {
+        return None;
+    }
+    if t > 0.0 && crate::click::raycast(bot, eye, dir, t).is_some_and(|h| h.dist < t) {
+        return None;
+    }
+    Some(t)
+}
+
+/// A point on `m` (moved by `lead`) our eyes see in the entity range with nothing in
+/// between: the middle of its box at our eye height first, then higher and lower (over
+/// grass, under a ledge). None when no such point: walk closer, or around.
+fn aim_point(bot: &Client, eye: Vec3, m: &Mob, lead: Vec3, others: &[Mob]) -> Option<Vec3> {
+    let moved = Mob { pos: m.pos + lead, ..m.clone() };
+    let (y0, h) = (moved.pos.y, moved.height);
+    let r = (moved.width / 2.0 - 0.1).max(0.05);
+    let c = moved.pos;
+    let mut ys = vec![eye.y.clamp(y0 + 0.15 * h, y0 + 0.85 * h), y0 + 0.8 * h, y0 + 0.5 * h, y0 + 0.25 * h];
+    ys.dedup_by(|a, b| (*a - *b).abs() < 0.05);
+    // the middle, then the side towards us (round a corner)
+    let near = moved.nearest_point(eye);
+    let toward = Vec3::new(near.x.clamp(c.x - r, c.x + r), 0.0, near.z.clamp(c.z - r, c.z + r));
+    for (x, z) in [(c.x, c.z), (toward.x, toward.z)] {
+        for &y in &ys {
+            let p = Vec3::new(x, y, z);
+            let d = p - eye;
+            let len = d.length();
+            if len < 1e-6 {
+                return Some(p);
+            }
+            if picks(bot, eye, d * (1.0 / len), &moved, others).is_some() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// The plant in the way (grass, a flower: broken at once) when one hides `m` from our
+/// eyes: a player knocks it away with the first click, and so do we.
+fn plant_in_way(bot: &Client, eye: Vec3, m: &Mob) -> Option<azalea::BlockPos> {
+    let p = Vec3::new(m.pos.x, eye.y.clamp(m.pos.y + 0.15 * m.height, m.pos.y + 0.85 * m.height), m.pos.z);
+    let d = p - eye;
+    let len = d.length();
+    let hit = crate::click::raycast(bot, eye, d * (1.0 / len.max(1e-6)), len)?;
+    let state = crate::world::block_at(bot, hit.pos);
+    let kind = azalea::registry::builtin::BlockKind::from(state);
+    let instant = state.to_trait().behavior().destroy_time == 0.0;
+    (instant && hit.dist < crate::click::REACH && !crate::survival::is_hazard_block(kind) && crate::dig::breakable(state)).then_some(hit.pos)
+}
+
 /// Hits `target` with what we hold: our own attack packet, then the arm swing.
 ///
-/// The server's `handleAttack` checks: the target exists in our world and inside the border,
-/// it is within reach of our eyes (entity interaction range 3.0 to its box, plus a
-/// tolerance), and it is not an item, an orb, an arrow or ourselves (any of those is a
-/// kick for an invalid attack). It does not check the look, but we have looked at it a
-/// tick before, as a player does. The damage scales with the charge: the server counts
-/// ticks since the last swing (`ServerboundPunch` resets the counter, the attack itself
-/// does not), so the punch goes after the attack, and we hit only at full charge.
-/// Returns whether the hit was sent.
+/// As a player's click: the look the server already has (sent in the last tick's movement
+/// packet) must put the crosshair on the target's box, within the entity range of 3.0
+/// from the eyes, with no block outline and no other mob in front of it. Then what the
+/// server's `handleAttack` checks: the target is in our world, it is not an item, an orb,
+/// an arrow or ourselves (any of those is a kick), and our weapon's charge (we wait for a
+/// full one; the server counts ticks since the last `ServerboundPunch`, which resets it,
+/// so the punch goes after the attack). Returns whether the hit was sent.
 pub fn strike(bot: &Client, target: Entity) -> bool {
     let Some(m) = mob(bot, target) else { return false };
     // the same world: a mob row from the dimension we just left is not attackable
@@ -416,10 +503,17 @@ pub fn strike(bot: &Client, target: Entity) -> bool {
     if ours.is_none() || ours != theirs || m.entity == bot.entity {
         return false;
     }
-    let dist = m.box_distance(crate::click::eye(bot));
-    if dist > REACH || !charged(bot) || !alive(bot) {
+    if !charged(bot) || !alive(bot) {
         return false;
     }
+    let Ok(look) = bot.direction() else { return false };
+    let eye = crate::click::eye(bot);
+    let dir = look_vector(look.y_rot(), look.x_rot());
+    let others = mobs_near(bot, ENTITY_RANGE + 3.0);
+    let Some(dist) = picks(bot, eye, dir, &m, &others) else {
+        debug!("not hitting {:?}: not in the crosshair (box {:.2} away)", m.kind, m.box_distance(eye));
+        return false;
+    };
     bot.write_packet(ServerboundAttack { entity_id: m.id });
     bot.write_packet(ServerboundPunch);
     CHARGE_START.store(bot.ticks_connected(), Ordering::Relaxed);
@@ -447,6 +541,9 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
     let mut fleeing = false;
     let mut hits = 0;
     let mut want_hit = false;
+    // ticks near it without a clear line to it (a wall, a fence): then the path goes round
+    let mut unseen = 0u32;
+    let mut path_until = 0u64;
     // progress: the target's health or distance must change now and then, else it is out
     // of reach (behind a wall, up a cliff) and we leave it
     let mut best = (first.health, first.box_distance(crate::world::me(bot).up(1.62)));
@@ -463,7 +560,7 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
         last_kind = m.kind;
         let now = bot.ticks_connected();
         let me = crate::world::me(bot);
-        let eye = me.up(1.62);
+        let eye = crate::click::eye(bot);
         let vel = m.pos - last_pos;
         last_pos = m.pos;
         let dist = m.box_distance(eye);
@@ -518,7 +615,7 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
             direct_until = now + 60;
         }
         let close = flat_d < 4.5 && (m.pos.y - me.y).abs() < 2.0;
-        let direct = close || in_water || now < direct_until || role == Role::Flying;
+        let direct = (close && now >= path_until) || in_water || now < direct_until || role == Role::Flying;
         if !direct {
             // far, or above/below: the pathfinder knows the way round
             let moved = pathing_to.is_none_or(|p| p.distance_to(m.pos) > 2.0);
@@ -532,13 +629,37 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
                 // waited for: a goto sent before the stop is read gets cancelled by it
                 crate::world::stop_path(bot).await;
             }
-            // aim at the box point nearest our eyes, a tick ahead of its movement
-            let p = m.nearest_point(eye) + vel;
-            let aim_at = Vec3::new(p.x, p.y.clamp(m.pos.y + 0.1, m.pos.y + m.height - 0.1), p.z);
-            aim(bot, aim_at);
+            // aim at a point of its box we see, a tick ahead of its movement; none in
+            // sight: face it and keep walking in
+            let others = mobs_near(bot, ENTITY_RANGE + 3.0);
+            let seen = aim_point(bot, eye, &m, vel, &others);
+            match seen {
+                Some(p) => {
+                    aim(bot, p);
+                    unseen = 0;
+                }
+                None => {
+                    if let Some(plant) = plant_in_way(bot, eye, &m) {
+                        bot.walk(WalkDirection::None);
+                        match crate::dig::dig(bot, plant).await {
+                            Ok(()) => debug!("broke the {:?} between us and {:?}", crate::world::kind_at(bot, plant), m.kind),
+                            Err(e) => debug!("could not clear {plant}: {e}"),
+                        }
+                        hold_weapon(bot).await;
+                        continue;
+                    }
+                    face(bot, m.center());
+                    unseen += 1;
+                    if unseen > 30 && !in_water {
+                        debug!("{:?} close but not in sight: pathing round", m.kind);
+                        path_until = now + 60;
+                        unseen = 0;
+                    }
+                }
+            }
             let walk = if now < retreat_until {
                 WalkDirection::Backward
-            } else if dist > REACH - 0.6 && role != Role::Flying {
+            } else if (dist > REACH - 0.6 || (seen.is_none() && dist > 1.0)) && role != Role::Flying {
                 if !in_water && !safe_step(bot, toward) {
                     WalkDirection::None
                 } else if role == Role::Ranged && dist > 2.0 {
@@ -559,7 +680,7 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
             // jumping is swimming up in water: keeps our head out of it
             bot.set_jumping(in_water || (blocked && on_ground && forward)).ok();
             // the hit goes out next tick, after the movement packet with this look
-            want_hit = dist <= REACH + 0.3 && charged(bot);
+            want_hit = seen.is_some() && charged(bot);
         }
         bot.wait_ticks(1).await;
         if std::mem::take(&mut want_hit) && strike(bot, target) {

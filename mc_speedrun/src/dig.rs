@@ -47,7 +47,17 @@ fn progress_with(bot: &Client, state: BlockState, slot: usize) -> f32 {
 
 /// The hotbar slot that breaks `state` fastest, preferring one that also gets its drop.
 fn best_slot(bot: &Client, state: BlockState) -> usize {
-    (0..9).max_by(|&a, &b| progress_with(bot, state, a).total_cmp(&progress_with(bot, state, b))).unwrap_or(0)
+    // the held one unless another is strictly faster: grass breaks at once with anything,
+    // and swapping the sword away for it costs the fight its charge
+    let held = bot.selected_hotbar_slot().unwrap_or(0) as usize;
+    let mut best = (held, progress_with(bot, state, held));
+    for slot in 0..9 {
+        let p = progress_with(bot, state, slot);
+        if p > best.1 {
+            best = (slot, p);
+        }
+    }
+    best.0
 }
 
 /// Whether the block can be broken at all by a player: not air, not a fluid, not bedrock,

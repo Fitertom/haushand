@@ -135,21 +135,48 @@ pub async fn eat(bot: &Client, kind: ItemKind) -> Result<bool> {
         use_held_item(bot);
         // 32 ticks of eating, then the server's answer; real time too, for a slow server
         let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        let mut interrupted = false;
         for _ in 0..60 {
             bot.wait_ticks(1).await;
-            if inv::count_kind(bot, kind) < before.0 || food_level(bot) > before.1 {
+            // the server's word: the food bar it sends (golden apples and a full bar
+            // aside, eating always raises it), or the stack it shrank
+            if food_level(bot) > before.1 || inv::count_kind(bot, kind) < before.0 {
                 // the food bar and the stack come in separate packets: let both land
                 bot.wait_ticks(2).await;
                 info!("ate {kind:?}: food {} -> {}, hp {hp:.0}", before.1, food_level(bot));
                 return Ok(true);
             }
             if !combat::alive(bot) || tokio::time::Instant::now() > deadline {
+                interrupted = true;
                 break;
             }
+            // a mob at arm's length: standing still eating is taking its hits
+            if combat::pick_target(bot).is_some_and(|m| m.box_distance(crate::click::eye(bot)) < 2.5) {
+                info!("eating {kind:?} interrupted: a mob is on us");
+                release_use_item(bot);
+                return Ok(false);
+            }
+        }
+        // the hand is still up as far as the server knows: let it down before anything else
+        release_use_item(bot);
+        if interrupted && !combat::alive(bot) {
+            return Ok(false);
         }
         warn!("eating {kind:?} gave nothing (attempt {attempt})");
+        bot.wait_ticks(2).await;
     }
     Ok(false)
+}
+
+/// Lets go of the use button: the server stops the eating (or the bow, the shield).
+fn release_use_item(bot: &Client) {
+    use azalea::protocol::packets::game::s_player_action::{Action, ServerboundPlayerAction};
+    bot.write_packet(ServerboundPlayerAction {
+        action: Action::ReleaseUseItem,
+        pos: BlockPos::new(0, 0, 0),
+        direction: azalea::core::direction::Direction::Down,
+        seq: 0,
+    });
 }
 
 /// Eats when `what_to_eat` says so. True when something was eaten.
@@ -397,7 +424,11 @@ impl Drop for TendGuard {
 /// Handles whatever needs handling now: hazards, mobs, hunger, then food when there is
 /// none. Returns at once when nothing does. Call it often from long loops; walks call it by
 /// themselves (`combat::goto_guarded`). Boxed, since walks inside it call it again.
-pub fn tend(bot: &Client) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
+pub async fn tend(bot: &Client) -> Result<()> {
+    tend_boxed(bot).await
+}
+
+fn tend_boxed(bot: &Client) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
     Box::pin(async move {
         if !combat::alive(bot) || TENDING.load(Ordering::Relaxed) >= 2 {
             return Ok(());
