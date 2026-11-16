@@ -567,6 +567,7 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
     let mut fleeing = false;
     let mut hits = 0;
     let mut want_hit = false;
+    let mut last_logged_health = first.health;
     // ticks near it without a clear line to it (a wall, a fence): then the path goes round
     let mut unseen = 0u32;
     let mut path_until = 0u64;
@@ -599,6 +600,10 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
         let flat_d = flat.length().max(0.001);
         let toward = flat * (1.0 / flat_d);
 
+        if (m.health - last_logged_health).abs() > 0.05 {
+            info!("fight {:?}: health {:.1} (hits {hits}, want_hit {want_hit})", m.kind, m.health);
+            last_logged_health = m.health;
+        }
         if m.health < best.0 - 0.1 || dist < best.1 - 0.5 {
             best = (best.0.min(m.health), best.1.min(dist));
             last_progress = Instant::now();
