@@ -109,6 +109,11 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
         }
         // What the bot thinks stands in a column under it and around: to check chunk decoding
         // against the server's view.
+        // The blocks around us, layer by layer (MAP="radius below above").
+        "map" => {
+            let v: Vec<i32> = std::env::var("MAP").unwrap_or("6 6 3".into()).split_whitespace().filter_map(|w| w.parse().ok()).collect();
+            crate::mine::dump(bot, v[0], v[1], v[2]);
+        }
         // A short walk, our position logged each half second, to compare with the server's.
         "walk" => {
             let f = crate::world::feet(bot);

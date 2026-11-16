@@ -457,6 +457,13 @@ fn check_floor(bot: &Client, pos: BlockPos) -> Result<bool, Blocked> {
     }
 }
 
+/// Whether a missing floor at `floor` (under the spot `above`, which we come to from
+/// `from`) can be put down once `above` is dug: some block around it other than the one
+/// under our own feet (whose side the eyes cannot see) to click against.
+fn floor_placeable(bot: &Client, floor: BlockPos, from: BlockPos) -> bool {
+    neighbours(floor).iter().any(|&n| n != floor + UP && n != from + DOWN && click::clickable(world_lock(bot).read().get_block_state(n)) && !place::replaceable(block_at(bot, n)))
+}
+
 /// One step of a staircase from where we stand in direction `d`, one block down: the head,
 /// feet and below-feet blocks in front are dug (3 high, so we walk in and drop one), a
 /// floor is put under the new spot if there is none.
@@ -468,6 +475,9 @@ async fn stair_step(bot: &Client, d: Dir) -> Result<(), Blocked> {
         check_open(bot, p, false)?;
     }
     let has_floor = check_floor(bot, floor)?;
+    if !has_floor && !floor_placeable(bot, floor, s + DOWN) {
+        return Err(Blocked::Way(format!("nothing to put a floor against at {floor}")));
+    }
     for p in [a, b, c] {
         dig(bot, p, false).await.map_err(way)?;
     }
@@ -495,13 +505,16 @@ async fn tunnel_step(bot: &Client, d: Dir, cover_lava: bool) -> Result<(), Block
             for q in [a, b] {
                 dig(bot, q, q == b).await.map_err(way)?;
             }
-            if !cover_lava {
+            if !cover_lava || !floor_placeable(bot, floor, s) {
                 return Err(Blocked::LavaBelow(p));
             }
             false
         }
         r => r?,
     };
+    if !has_floor && !floor_placeable(bot, floor, s) {
+        return Err(Blocked::Way(format!("nothing to put a floor against at {floor}")));
+    }
     for q in [a, b] {
         dig(bot, q, false).await.map_err(way)?;
     }
@@ -558,23 +571,110 @@ fn dry_spot(bot: &Client, radius: i32) -> Option<BlockPos> {
     best.map(|(_, p)| p)
 }
 
-/// Digs a staircase down until our feet are at `target_y`.
-pub async fn descend(bot: &Client, target_y: i32) -> Result<()> {
-    crate::obtain::hotbar_tools(bot).await;
-    if feet(bot).y > 40
-        && let Some(p) = dry_spot(bot, 2).filter(|&p| p == feet(bot)).or_else(|| dry_spot(bot, 24))
-        && p != feet(bot)
-    {
-        info!("starting the staircase away from water, at {p}");
-        if let Err(e) = goto(bot, BlockPosGoal(p), Duration::from_secs(40)).await {
-            info!("could not walk to {p}: {e}");
+/// A spot to stand on, lower down in a cave we see into: open, two high, a floor whose top
+/// the eyes see, no liquid in or beside it. Lowest first, then nearest.
+fn cave_spots(bot: &Client, min_y: i32) -> Vec<BlockPos> {
+    let f = feet(bot);
+    let here = me(bot);
+    let mut out = Vec::new();
+    for dx in -10..=10 {
+        for dz in -10..=10 {
+            for dy in -14..=-2 {
+                let p = BlockPos::new(f.x + dx, f.y + dy, f.z + dz);
+                if p.y < min_y {
+                    continue;
+                }
+                if !(solid(block_at(bot, p + DOWN)) && open(block_at(bot, p)) && open(block_at(bot, p + UP))) {
+                    continue;
+                }
+                if liquid_next_to(bot, p, false).is_some() || liquid_next_to(bot, p + UP, false).is_some() {
+                    continue;
+                }
+                out.push(p);
+            }
         }
     }
+    out.sort_by(|a, b| a.y.cmp(&b.y).then(a.center().distance_squared_to(here).total_cmp(&b.center().distance_squared_to(here))));
+    out.retain(|&p| in_view(bot, p + DOWN, VIEW));
+    out
+}
+
+/// Down through a cave the staircase broke into, walking (falls of three at most, no
+/// digging) to a lower spot we see. Returns whether we got lower.
+async fn cave_down(bot: &Client, target_y: i32) -> bool {
+    let y0 = feet(bot).y;
+    for spot in cave_spots(bot, target_y).into_iter().take(2) {
+        info!("down the cave to {spot}");
+        let secs = 10.0 + me(bot).distance_to(spot.center()) * 0.8;
+        let r = goto(bot, BlockPosGoal(spot), Duration::from_secs_f64(secs)).await;
+        if feet(bot).y < y0 - 1 {
+            if let Err(e) = seal_around(bot).await {
+                info!("after the cave: {e}");
+            }
+            return true;
+        }
+        if let Err(e) = r {
+            info!("cave path to {spot}: {e}");
+        }
+    }
+    false
+}
+
+/// Digs a staircase down until our feet are at `target_y`. Where it gets stuck (a cave
+/// with no floor to put down, water all round) it goes back up to where it started and
+/// tries again from a spot away from there.
+pub async fn descend(bot: &Client, target_y: i32) -> Result<()> {
+    crate::obtain::hotbar_tools(bot).await;
+    let t0 = bot.ticks_connected();
+    let mut top = feet(bot);
+    let mut err = eyre!("not started");
+    for attempt in 0..4 {
+        if attempt > 0 {
+            let stuck = feet(bot);
+            info!("staircase stuck at {stuck} ({err}); back up to {top} to start elsewhere");
+            let secs = 30.0 + me(bot).distance_to(top.center()) * 0.8;
+            if let Err(e) = goto(bot, BlockPosGoal(top), Duration::from_secs_f64(secs)).await {
+                bail!("stuck descending at {stuck} and no way back up: {e}");
+            }
+            // away from where it got stuck, turned a quarter more each attempt
+            let mut away = BlockPos::new((top.x - stuck.x).signum(), 0, (top.z - stuck.z).signum());
+            if away.x == 0 && away.z == 0 {
+                away = BlockPos::new(1, 0, 0);
+            }
+            for _ in 1..attempt {
+                away = turn_right(away);
+            }
+            let goal = azalea::pathfinder::goals::XZGoal { x: top.x + away.x * 20, z: top.z + away.z * 20 };
+            let _ = goto(bot, goal, Duration::from_secs(40)).await;
+        }
+        if feet(bot).y > 40
+            && let Some(p) = dry_spot(bot, 2).filter(|&p| p == feet(bot)).or_else(|| dry_spot(bot, 24))
+            && p != feet(bot)
+        {
+            info!("starting the staircase away from water, at {p}");
+            if let Err(e) = goto(bot, BlockPosGoal(p), Duration::from_secs(40)).await {
+                info!("could not walk to {p}: {e}");
+            }
+        }
+        top = feet(bot);
+        match staircase(bot, target_y).await {
+            Ok(()) => {
+                info!("at y {} after a staircase from {top}, {} ticks", feet(bot).y, bot.ticks_connected() - t0);
+                return Ok(());
+            }
+            Err(e) => err = e,
+        }
+    }
+    Err(err)
+}
+
+/// The staircase from where we stand, down to `target_y`.
+async fn staircase(bot: &Client, target_y: i32) -> Result<()> {
     let mut d = facing(bot);
     let mut fails = 0;
-    let start = feet(bot);
-    let t0 = bot.ticks_connected();
-    info!("descending from {start} to y {target_y}");
+    let mut rounds = 0;
+    let mut last: Option<Dir> = None;
+    info!("descending from {} to y {target_y}", feet(bot));
     while feet(bot).y > target_y {
         if inv::count_kind(bot, ItemKind::WaterBucket) == 0 {
             take_seen_water(bot).await;
@@ -588,24 +688,50 @@ pub async fn descend(bot: &Client, target_y: i32) -> Result<()> {
                 info!("stair step {d:?} from {} blocked: {e}", feet(bot));
                 fails += 1;
                 d = turn_right(d);
-                if fails % 4 == 0 {
-                    // every side is blocked: move along level a bit and try again
-                    let mut moved = false;
-                    for _ in 0..4 {
-                        if tunnel_step(bot, d, true).await.is_ok() {
-                            moved = true;
-                            break;
+                if fails % 4 != 0 {
+                    continue;
+                }
+                if cave_down(bot, target_y).await {
+                    continue;
+                }
+                // every side is blocked: tunnel on level a few blocks, away from here,
+                // and try again
+                rounds += 1;
+                if rounds > 3 {
+                    bail!("stairs blocked all round at {}", feet(bot));
+                }
+                let mut moved = 0;
+                let mut order = vec![last.unwrap_or(d)];
+                for _ in 0..3 {
+                    order.push(turn_right(*order.last().unwrap()));
+                }
+                // never straight back the way the last level tunnel came
+                if let Some(l) = last {
+                    order.retain(|&o| o != BlockPos::new(-l.x, 0, -l.z));
+                }
+                for o in order {
+                    while moved < 5 {
+                        match tunnel_step(bot, o, true).await {
+                            Ok(()) => moved += 1,
+                            Err(e) => {
+                                info!("level tunnel {o:?} from {}: {e}", feet(bot));
+                                break;
+                            }
                         }
-                        d = turn_right(d);
                     }
-                    if !moved || fails > 16 {
-                        bail!("stuck descending at {}", feet(bot));
+                    if moved > 0 {
+                        last = Some(o);
+                        d = o;
+                        break;
                     }
+                }
+                info!("stairs blocked all round: tunnelled {moved} to {}", feet(bot));
+                if moved == 0 {
+                    bail!("stuck descending at {}", feet(bot));
                 }
             }
         }
     }
-    info!("at y {} after a staircase from {start}, {} ticks", feet(bot).y, bot.ticks_connected() - t0);
     Ok(())
 }
 
@@ -1004,7 +1130,10 @@ pub async fn water_bucket(bot: &Client, radius: f64) -> Result<()> {
         };
         match r {
             Ok(()) => match fill(bot, pos).await {
-                Ok(()) => return Ok(()),
+                Ok(()) => {
+                    info!("water bucket filled at {pos}");
+                    return Ok(());
+                }
                 Err(e) => info!("water at {pos}: {e}"),
             },
             Err(e) => info!("water at {pos}: {e}"),
@@ -1419,4 +1548,24 @@ pub async fn portal_room(bot: &Client) -> Result<crate::portal::Site> {
     walk_to(bot, site.stand()).await?;
     seal_around(bot).await?;
     Ok(site)
+}
+
+/// Logs the blocks around us layer by layer (test stage `map`): `#` solid, `.` open, `~`
+/// water, `L` lava, `@` us, `o` other.
+pub fn dump(bot: &Client, r: i32, below: i32, above: i32) {
+    let f = feet(bot);
+    for dy in (-below..=above).rev() {
+        let mut lines = Vec::new();
+        for dz in -r..=r {
+            let mut line = String::new();
+            for dx in -r..=r {
+                let p = BlockPos::new(f.x + dx, f.y + dy, f.z + dz);
+                let st = block_at(bot, p);
+                let c = if p == f { '@' } else if fluid(st) == FluidKind::Water { '~' } else if fluid(st) == FluidKind::Lava { 'L' } else if solid(st) { '#' } else if open(st) { '.' } else { 'o' };
+                line.push(c);
+            }
+            lines.push(line);
+        }
+        info!("y {} (x {}..{}, z down from {}):\n{}", f.y + dy, f.x - r, f.x + r, f.z - r, lines.join("\n"));
+    }
 }
