@@ -4,12 +4,14 @@
 //! owner says `!go` (the whole run), `!stage <name>` (one stage, for testing), `!stop`,
 //! `!inv`, `!pos`.
 
+mod combat;
 mod craft;
 mod inv;
 mod obtain;
 mod place;
 mod telemetry;
 mod run;
+mod survival;
 mod world;
 
 use std::sync::Arc;
@@ -22,6 +24,9 @@ use tracing::{error, info};
 #[derive(Clone, Component, Default)]
 struct State {
     task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// What the last `start` ran (a stage, or None for the whole run): it is started again
+    /// after a death.
+    last: Arc<Mutex<Option<Option<String>>>>,
 }
 
 struct Args {
@@ -86,8 +91,11 @@ async fn handle(bot: Client, event: Event, state: State) -> eyre::Result<()> {
     let a = ARGS.get().unwrap();
     match event {
         Event::Tick => telemetry::sample(&bot),
-        Event::Packet(p) => telemetry::packet(&bot, &p),
-        Event::Death(_) => telemetry::record(&bot, "death", serde_json::json!({})),
+        Event::Packet(p) => {
+            telemetry::packet(&bot, &p);
+            combat::packet(&bot, &p);
+        }
+        Event::Death(_) => on_death(&bot, &state),
         Event::Spawn if a.autostart && state.task.lock().is_none() => start(&bot, &state, a.stage.clone()),
         Event::Chat(m) => {
             let (sender, content) = m.split_sender_and_content();
@@ -131,6 +139,7 @@ fn start(bot: &Client, state: &State, stage: Option<String>) {
         bot.chat("already running, !stop first");
         return;
     }
+    *state.last.lock() = Some(stage.clone());
     let bot = bot.clone();
     *task = Some(tokio::spawn(async move {
         let result = match &stage {
@@ -145,4 +154,33 @@ fn start(bot: &Client, state: &State, stage: Option<String>) {
             }
         }
     }));
+}
+
+/// The run's task works on a world that is gone (inventory dropped, far from spawn): stop
+/// it, wait for the respawn, fetch what we dropped if it is near, and start the same run
+/// again. Stages are goals on the inventory, so it goes on from what is left.
+fn on_death(bot: &Client, state: &State) {
+    static HANDLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // azalea sends Death for the kill packet and for health reaching 0: handle one
+    if HANDLING.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let pos = bot.position().ok();
+    telemetry::record(bot, "death", serde_json::json!({"x": pos.map(|p| p.x), "y": pos.map(|p| p.y), "z": pos.map(|p| p.z)}));
+    error!("died at {pos:?}");
+    if let Some(t) = state.task.lock().take() {
+        t.abort();
+    }
+    bot.force_stop_pathfinding();
+    bot.walk(azalea::WalkDirection::None);
+    let (bot, state) = (bot.clone(), state.clone());
+    tokio::spawn(async move {
+        survival::after_death(&bot, pos).await;
+        HANDLING.store(false, std::sync::atomic::Ordering::SeqCst);
+        let last = state.last.lock().clone();
+        if let Some(stage) = last {
+            info!("resuming {} after death", stage.as_deref().unwrap_or("the run"));
+            start(&bot, &state, stage);
+        }
+    });
 }
