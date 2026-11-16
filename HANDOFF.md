@@ -1,6 +1,6 @@
 # Handoff: mc_speedrun + azalea (Minecraft 26.3)
 
-This branch only stores the speedrun bot next to the HausHand site files; the two are unrelated.
+This branch stores the speedrun bot and its Azalea port.
 
 Start with `mc_speedrun/HANDOFF.md`, then `mc_speedrun/STATUS.md`, `mc_speedrun/TESTING.md`,
 `mc_speedrun/KNOWLEDGE.md`, `azalea/PORT_26.3.md`.

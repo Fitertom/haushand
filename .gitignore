@@ -1,12 +1,6 @@
-# Выкладываем только файлы сайта
+# Speedrun bot + its Azalea port (26.3)
 /*
-!/index.html
-!/script.js
-!/styles.css
 !/.gitignore
-!/.nojekyll
-
-# Speedrun bot handoff stored alongside the site (this branch only)
 !/HANDOFF.md
 !/mc_speedrun/
 !/azalea/
