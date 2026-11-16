@@ -49,6 +49,13 @@ pub fn default_move(ctx: &mut MovesCtx, node: RelBlockPos) {
     uncommon::uncommon_move(ctx, node);
 }
 
+/// Moves for walking underground: no digging straight down and no parkour
+/// jumps (a missed jump over a gap can end in lava).
+pub fn underground_move(ctx: &mut MovesCtx, node: RelBlockPos) {
+    basic::basic_move_no_dig_down(ctx, node);
+    uncommon::uncommon_move(ctx, node);
+}
+
 #[derive(Clone)]
 pub struct MoveData {
     /// Use the context to determine what events should be sent to complete this

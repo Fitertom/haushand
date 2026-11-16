@@ -61,6 +61,45 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
             obtain(bot, Items::one(ItemKind::IronSword), 1).await?;
             hotbar_tools(bot).await;
         }
+        // Down a staircase to diamond level, carrying what is needed there: a second bucket
+        // (water to cast obsidian with, one to carry lava), sticks for the diamond pickaxe,
+        // stone to seal lava and floor gaps, and water from the surface if there is some.
+        "descend" => {
+            obtain(bot, items!(Bucket, WaterBucket, LavaBucket), 2).await?;
+            obtain(bot, Items::one(ItemKind::Stick), 2).await?;
+            obtain(bot, items!(CraftingTable), 1).await?;
+            obtain(bot, craft::stone_material(), 16).await?;
+            if let Err(e) = crate::mine::water_bucket(bot, 64.0).await {
+                info!("no water bucket on the way down: {e}");
+            }
+            hotbar_tools(bot).await;
+            if crate::world::feet(bot).y > crate::mine::DIAMOND_Y + 1 {
+                crate::mine::descend(bot, crate::mine::DIAMOND_Y).await?;
+            }
+        }
+        // 3 diamonds, made into a diamond pickaxe at once (sticks and table carried down).
+        "diamonds" => {
+            if inv::count_kind(bot, ItemKind::DiamondPickaxe) == 0 {
+                crate::mine::diamonds(bot, 3).await?;
+                obtain(bot, Items::one(ItemKind::DiamondPickaxe), 1).await?;
+                hotbar_tools(bot).await;
+            }
+        }
+        // 10 obsidian, the corners of a portal frame left out, cast from lava with the two
+        // buckets; then room for the portal dug right there, at diamond level.
+        "obsidian" => {
+            if inv::count_kind(bot, ItemKind::Obsidian) < 10 {
+                if inv::count_kind(bot, ItemKind::DiamondPickaxe) == 0 {
+                    crate::mine::diamonds(bot, 3).await?;
+                    obtain(bot, Items::one(ItemKind::DiamondPickaxe), 1).await?;
+                }
+                hotbar_tools(bot).await;
+                crate::mine::obsidian(bot, 10).await?;
+            }
+            if crate::portal::dimension(bot) == "minecraft:overworld" && crate::world::feet(bot).y < 40 {
+                crate::mine::portal_room(bot).await?;
+            }
+        }
         // A portal from what the bot carries (10 obsidian, 4 corner blocks), lit, entered.
         "portal" => {
             if crate::portal::dimension(bot) != "minecraft:overworld" {
@@ -88,6 +127,11 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
         }
         // What the bot thinks stands in a column under it and around: to check chunk decoding
         // against the server's view.
+        // The blocks around us, layer by layer (MAP="radius below above").
+        "map" => {
+            let v: Vec<i32> = std::env::var("MAP").unwrap_or("6 6 3".into()).split_whitespace().filter_map(|w| w.parse().ok()).collect();
+            crate::mine::dump(bot, v[0], v[1], v[2]);
+        }
         // A short walk, our position logged each half second, to compare with the server's.
         "walk" => {
             let f = crate::world::feet(bot);

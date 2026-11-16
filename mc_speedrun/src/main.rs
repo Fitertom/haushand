@@ -9,6 +9,7 @@ mod combat;
 mod craft;
 mod dig;
 mod inv;
+mod mine;
 mod nether;
 mod obtain;
 mod place;

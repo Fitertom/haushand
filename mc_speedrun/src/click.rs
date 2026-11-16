@@ -129,8 +129,41 @@ pub struct Hit {
 /// Where a ray from `from` in direction `dir` (unit) first meets a block outline, within
 /// `max`. Blocks are walked one by one along the ray; in each, the outline boxes (a slab is
 /// half a block, a fence a post) are tested, so a ray passes over a slab and through grass
-/// the way the game's own pick does. Unloaded blocks stop the ray.
+/// the way the game's own pick does. Unloaded blocks stop the ray. Fluids have no outline:
+/// the ray goes through them (see `raycast_fluids`).
 pub fn raycast(bot: &Client, from: Vec3, dir: Vec3, max: f64) -> Option<Hit> {
+    raycast_fluids(bot, from, dir, max, Fluids::None)
+}
+
+/// Which fluids stop a ray, besides block outlines: vanilla's `ClipContext.Fluid`. An empty
+/// bucket's pick stops at sources only (`SourceOnly`), a full bucket's and the crosshair's
+/// at none; `Any` is for what the eyes see (lava is opaque).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fluids {
+    None,
+    SourceOnly,
+    Any,
+}
+
+/// The shape a fluid stops a ray with, as vanilla's `FlowingFluid.getShape`: a box as high as
+/// the fluid (a source 8/9), the full block when the same fluid is above.
+fn fluid_box(state: BlockState, above: Option<BlockState>, pick: Fluids) -> Option<f64> {
+    use azalea::block::fluid_state::{FluidKind, FluidState};
+    let f = FluidState::from(state);
+    let ok = match pick {
+        Fluids::None => false,
+        Fluids::SourceOnly => f.kind != FluidKind::Empty && f.amount == 8,
+        Fluids::Any => f.kind != FluidKind::Empty && f.amount > 0,
+    };
+    if !ok {
+        return None;
+    }
+    let same_above = above.is_some_and(|a| FluidState::from(a).kind == f.kind);
+    Some(if same_above { 1.0 } else { f.amount as f64 / 9.0 })
+}
+
+/// [`raycast`] where fluids of `pick` stop the ray too, at their surface.
+pub fn raycast_fluids(bot: &Client, from: Vec3, dir: Vec3, max: f64, pick: Fluids) -> Option<Hit> {
     let world = crate::world::world_lock(bot);
     let world = world.read();
     let mut cell = BlockPos::from(from);
@@ -147,8 +180,11 @@ pub fn raycast(bot: &Client, from: Vec3, dir: Vec3, max: f64) -> Option<Hit> {
         if !state.is_air() {
             let off = Vec3::new(cell.x as f64, cell.y as f64, cell.z as f64);
             let mut best: Option<(f64, Direction)> = None;
-            for b in state.outline_shape(cell).to_aabbs() {
-                let b = b.move_relative(off);
+            let mut boxes: Vec<Aabb> = state.outline_shape(cell).to_aabbs().into_iter().map(|b| b.move_relative(off)).collect();
+            if let Some(h) = fluid_box(state, world.get_block_state(cell.up(1)), pick) {
+                boxes.push(Aabb { min: off, max: off + Vec3::new(1.0, h, 1.0) });
+            }
+            for b in boxes {
                 if let Some((te, face)) = ray_box(from, dir, &b)
                     && te <= max
                     && best.is_none_or(|(bt, _)| te < bt)

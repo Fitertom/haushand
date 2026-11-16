@@ -1,4 +1,41 @@
-# Status (2026-11-16)
+# Status (2026-11-16, session 2)
+
+## Session 2 summary (lead)
+
+Layout now: repo `Fitertom/haushand`, branch `claude/mc-speedrun-azalea-handoff-o87msf`,
+`mc_speedrun/` and `azalea/` side by side (the bot finds `../azalea/azalea`).
+
+Owner's rules (strict): no Azalea interaction helpers — look and packets are ours; nothing
+that looks like cheating — every click/dig/hit only on what the eyes see (own raycast),
+in reach, after looking at it.
+
+- wood→stone→iron end to end on peaceful: 7025 ticks on seed -613993438115203091.
+- `click.rs`: own look (yaw/pitch into LookDirection, sent with the tick's movement packet),
+  own raycast vs outline shapes, `sight`/`sees`, `use_item_on` with the server's checks.
+- `dig.rs`: own block breaking (seen face, progress counted by the game's rule, server-confirmed).
+- `place.rs`: seen faces only; `pillar_up`/`pillar_down`.
+- Stations (table, furnace) are carried: picked up after use, placed where needed.
+- `portal.rs`: stage `portal` (needs 10 obsidian + flint and steel): site, frame with
+  cobblestone corners built from a 3-high pillar, lit, entered — verified, in the nether.
+- `nether.rs`: stages `survey`, `fortress`: spiral search for nether bricks, legs walk,
+  fortress reached and its blaze spawner found on the test seed. The final walk to the
+  spawner spun forever (fixed in `walk_to`, NOT re-run).
+- Azalea fix: `open_container_at` no longer takes a stale ContainerSetContent as the open.
+- Pathfinder: `world::stop_path` (a force stop cancelled a goto sent right after it);
+  `goto_timeout` gives up after 100 ticks without moving.
+- dev: `fresh_world.sh [seed] [difficulty] [tickrate]`, MC_PORT/MC_RUN/RCON_PORT/TAG for
+  several servers; bot flags `--exit`, `--delay <ticks>`, `--stage a,b,c`.
+- `tools/report.py`: HTML report of a run log (see TESTING.md).
+- Merged at the end, NOT tested together: `work/combat` (combat.rs, survival.rs: fight,
+  eat, hazards, death → resume; idle guard in main.rs) and `work/mining` (mine.rs:
+  staircase, strip mining, obsidian casting, stages descend/diamonds/obsidian — last
+  commit is the stopped agent's WIP). Their own STATUS notes are below if they wrote any.
+  First thing next: build, run `--go` on the test seed, then each new stage alone.
+
+Next: blazes (combat at the spawner), pearls (endermen / bartering), eyes, stronghold,
+dragon.
+
+## Before session 2
 
 ## Works (tested live on a local 26.3 server at 60 TPS)
 

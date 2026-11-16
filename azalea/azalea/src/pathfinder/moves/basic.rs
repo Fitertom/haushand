@@ -20,6 +20,15 @@ pub fn basic_move(ctx: &mut MovesCtx, node: RelBlockPos) {
     downward_move(ctx, node);
 }
 
+/// [`basic_move`] without digging straight down: underground, the block under
+/// the one below can be a cave or lava the bot cannot see from above.
+pub fn basic_move_no_dig_down(ctx: &mut MovesCtx, node: RelBlockPos) {
+    forward_move(ctx, node);
+    ascend_move(ctx, node);
+    descend_move(ctx, node);
+    diagonal_move(ctx, node);
+}
+
 fn forward_move(ctx: &mut MovesCtx, pos: RelBlockPos) {
     let mut base_cost = SPRINT_ONE_BLOCK_COST;
     // it's for us cheaper to have the water cost be applied when leaving the
