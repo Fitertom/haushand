@@ -78,9 +78,19 @@ pub async fn reach(bot: &Client, pos: BlockPos) -> Result<()> {
 }
 
 /// `goto` with a deadline: a path that never ends (a goal walled off) must not hang a run.
+/// Also gives up early when the bot has not moved for a while: a goal the pathfinder
+/// cannot reach (a log up in a crown) left it standing for the whole deadline.
 /// Stops on the way to fight or eat when needed (`combat::goto_guarded`).
 pub async fn goto_timeout(bot: &Client, goal: impl azalea::pathfinder::goals::Goal + Clone + 'static, limit: Duration) -> Result<()> {
     crate::combat::goto_guarded(bot, goal, limit).await
+}
+
+/// Stops the pathfinder and waits for it to take the stop. The stop is a message read in
+/// the next update: a `goto` sent before then was cancelled by it, and the bot stood
+/// still for the whole of the next walk.
+pub async fn stop_path(bot: &Client) {
+    bot.force_stop_pathfinding();
+    bot.wait_ticks(2).await;
 }
 
 /// Mines the block at `pos` with the best tool in the hotbar and picks up what it drops.
@@ -201,7 +211,15 @@ pub async fn mine_until(bot: &Client, states: &BlockStates, items: &Items, want:
         if let Err(e) = mine_at(bot, pos).await {
             info!("could not mine {pos}: {e}");
             failed.push(pos);
-            if failed.len() > 20 {
+            // the rest of a tree is as out of reach as the log that failed: skip its column
+            if format!("{:?}", kind_at(bot, pos)).ends_with("Log") {
+                let near: Vec<BlockPos> = find_blocks(bot, states, 64, &failed)
+                    .into_iter()
+                    .filter(|p| (p.x - pos.x).abs() <= 2 && (p.z - pos.z).abs() <= 2)
+                    .collect();
+                failed.extend(near);
+            }
+            if failed.len() > 60 {
                 bail!("too many unreachable blocks for {items:?}");
             }
         }

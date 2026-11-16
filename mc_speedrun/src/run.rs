@@ -7,7 +7,7 @@ use tracing::info;
 
 use crate::{
     craft::{self, items},
-    inv::Items,
+    inv::{self, Items},
     obtain::{hotbar_tools, obtain},
 };
 
@@ -46,6 +46,12 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
             hotbar_tools(bot).await;
         }
         "iron" => {
+            // All the stage's iron in one smelt (pickaxe 3, bucket 3, sword 2): smelted per
+            // tool, each batch waited for its own furnace.
+            let ingots = 3 * (inv::count_kind(bot, ItemKind::IronPickaxe) == 0) as i32
+                + 3 * (inv::count_kind(bot, ItemKind::Bucket) == 0) as i32
+                + 2 * (inv::count_kind(bot, ItemKind::IronSword) == 0) as i32;
+            obtain(bot, Items::one(ItemKind::IronIngot), ingots).await?;
             obtain(bot, Items::one(ItemKind::IronPickaxe), 1).await?;
             obtain(bot, Items::one(ItemKind::Bucket), 1).await?;
             obtain(bot, Items::one(ItemKind::IronSword), 1).await?;
@@ -62,6 +68,14 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
                 bot.wait_ticks(10).await;
                 info!("walk at {:?} executing={}", crate::world::me(bot), bot.is_executing_path());
             }
+        }
+        // A path to PATHTO="x y z" (reach goal, as for mining), logging where we are.
+        "pathto" => {
+            let v: Vec<i32> = std::env::var("PATHTO")?.split_whitespace().map(|w| w.parse()).collect::<Result<_, _>>()?;
+            let target = azalea::BlockPos::new(v[0], v[1], v[2]);
+            info!("pathto: from {:?} to {target}", crate::world::me(bot));
+            let r = crate::world::reach(bot, target).await;
+            info!("pathto: {r:?}, now at {:?}", crate::world::me(bot));
         }
         // How many game ticks the client runs in ten real seconds: 200 at 20 TPS, 600 at 60.
         "tps" => {

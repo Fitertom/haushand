@@ -210,6 +210,21 @@ pub async fn place_near(bot: &Client, items: &Items) -> Result<BlockPos> {
             return Ok(p);
         }
     }
+    // Down a pit dug for stone every spot around is wall: dig a niche at foot level, on
+    // solid ground, and put it there.
+    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+        let p = BlockPos::new(f.x + dx, f.y, f.z + dz);
+        let under = block_at(bot, p.down(1));
+        if block_at(bot, p).is_air() || replaceable(under) || under.is_collision_shape_empty() {
+            continue;
+        }
+        if crate::world::mine_at(bot, p).await.is_err() || !block_at(bot, p).is_air() {
+            continue;
+        }
+        if place_at(bot, items, p).await.is_ok() {
+            return Ok(p);
+        }
+    }
     bail!("no spot near {f} to put {items:?}")
 }
 

@@ -334,7 +334,7 @@ pub async fn escape_hazards(bot: &Client) -> Result<bool> {
     if !in_hazard(bot) {
         return Ok(false);
     }
-    bot.force_stop_pathfinding();
+    crate::world::stop_path(bot).await;
     let Some(spot) = safe_spot(bot) else {
         warn!("in a hazard at {} and no safe spot near", world::feet(bot));
         return Ok(false);

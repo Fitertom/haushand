@@ -441,7 +441,7 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
             if !fleeing {
                 info!("creeper swelling at {flat_d:.1}, running");
                 if pathing_to.take().is_some() {
-                    bot.force_stop_pathfinding();
+                    crate::world::stop_path(bot).await;
                 }
             }
             fleeing = true;
@@ -485,7 +485,8 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
             }
         } else {
             if pathing_to.take().is_some() {
-                bot.force_stop_pathfinding();
+                // waited for: a goto sent before the stop is read gets cancelled by it
+                crate::world::stop_path(bot).await;
             }
             // aim at the box point nearest our eyes, a tick ahead of its movement
             let aim = m.nearest_point(eye) + vel;
@@ -527,7 +528,7 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
         bot.wait_ticks(1).await;
     };
     if pathing_to.is_some() {
-        bot.force_stop_pathfinding();
+        crate::world::stop_path(bot).await;
     }
     bot.walk(WalkDirection::None);
     bot.set_jumping(false).ok();
@@ -579,30 +580,42 @@ pub async fn hunt(bot: &Client, kinds: &[EntityKind], radius: f64) -> Result<Out
 /// to the same goal. Every walk of the run goes through here (`world::goto_timeout`), so a
 /// zombie met on the way is fought instead of followed home.
 pub async fn goto_guarded<G: Goal + Clone + 'static>(bot: &Client, goal: G, limit: Duration) -> Result<()> {
+    // game ticks, so the check means the same at any server tick rate; mining a block on
+    // the way stands still too, so the window is longer than any block the path mines
+    const STUCK_WINDOW: u32 = 100;
     let mut deadline = Instant::now() + limit;
     bot.start_goto(goal.clone());
     // make sure the goto event was handled before asking whether the goal is reached
     bot.wait_updates(1).await;
     let mut ticks = 0u32;
+    let mut window = (0u32, crate::world::me(bot));
     loop {
         if bot.is_goto_target_reached() {
             return Ok(());
         }
         if Instant::now() > deadline {
-            bot.force_stop_pathfinding();
+            crate::world::stop_path(bot).await;
             bail!("path timed out");
         }
         bot.wait_ticks(1).await;
         ticks += 1;
+        if ticks - window.0 >= STUCK_WINDOW {
+            let now = crate::world::me(bot);
+            if now.distance_to(window.1) < 0.5 {
+                crate::world::stop_path(bot).await;
+                bail!("path stuck: no move in {STUCK_WINDOW} ticks");
+            }
+            window = (ticks, now);
+        }
         if ticks % 4 == 0 && crate::survival::urgent(bot) {
-            bot.force_stop_pathfinding();
+            crate::world::stop_path(bot).await;
             bot.walk(WalkDirection::None);
-            bot.wait_updates(1).await;
             let paused = Instant::now();
             crate::survival::tend(bot).await?;
             deadline += paused.elapsed();
             bot.start_goto(goal.clone());
             bot.wait_updates(1).await;
+            window = (ticks, crate::world::me(bot));
         }
     }
 }
