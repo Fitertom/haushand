@@ -57,6 +57,17 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
             obtain(bot, Items::one(ItemKind::IronSword), 1).await?;
             hotbar_tools(bot).await;
         }
+        // A portal from what the bot carries (10 obsidian, 4 corner blocks), lit, entered.
+        "portal" => {
+            if crate::portal::dimension(bot) != "minecraft:overworld" {
+                return Ok(());
+            }
+            obtain(bot, Items::one(ItemKind::FlintAndSteel), 1).await?;
+            obtain(bot, craft::stone_material(), 4).await?;
+            let site = crate::portal::build(bot).await?;
+            crate::portal::light(bot, &site).await?;
+            crate::portal::enter(bot, &site).await?;
+        }
         // What the bot thinks stands in a column under it and around: to check chunk decoding
         // against the server's view.
         // A short walk, our position logged each half second, to compare with the server's.

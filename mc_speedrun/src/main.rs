@@ -4,10 +4,12 @@
 //! owner says `!go` (the whole run), `!stage <name>` (one stage, for testing), `!stop`,
 //! `!inv`, `!pos`.
 
+mod click;
 mod craft;
 mod inv;
 mod obtain;
 mod place;
+mod portal;
 mod telemetry;
 mod run;
 mod world;
@@ -31,12 +33,14 @@ struct Args {
     autostart: bool,
     /// Quit when the autostarted run ends, so a test does not idle until its timeout.
     exit: bool,
+    /// Game ticks to wait after spawning before an autostarted run (a test gives items first).
+    delay: usize,
     /// Run only this stage on spawn (testing without chat).
     stage: Option<String>,
 }
 
 fn args() -> Args {
-    let mut a = Args { server: "localhost".into(), name: "SpeedBot".into(), owner: None, autostart: false, exit: false, stage: None };
+    let mut a = Args { server: "localhost".into(), name: "SpeedBot".into(), owner: None, autostart: false, exit: false, delay: 0, stage: None };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         match k.as_str() {
@@ -45,6 +49,7 @@ fn args() -> Args {
             "--owner" => a.owner = it.next(),
             "--go" => a.autostart = true,
             "--exit" => a.exit = true,
+            "--delay" => a.delay = it.next().and_then(|v| v.parse().ok()).expect("--delay needs ticks"),
             "--stage" => {
                 a.autostart = true;
                 a.stage = it.next();
@@ -136,6 +141,10 @@ fn start(bot: &Client, state: &State, stage: Option<String>) {
     }
     let bot = bot.clone();
     *task = Some(tokio::spawn(async move {
+        let delay = ARGS.get().map_or(0, |a| a.delay);
+        if delay > 0 {
+            bot.wait_ticks(delay).await;
+        }
         let result = match &stage {
             Some(s) => run::stage(&bot, s).await,
             None => run::all(&bot).await,

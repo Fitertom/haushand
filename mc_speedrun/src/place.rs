@@ -10,8 +10,7 @@ use std::time::Duration;
 use azalea::{
     BlockPos, Client, Vec3,
     block::BlockState,
-    core::{aabb::Aabb, direction::Direction, hit_result::HitResult},
-    entity::dimensions::EntityDimensions,
+    core::{aabb::Aabb, direction::Direction},
     pathfinder::goals::RadiusGoal,
     physics::collision::BlockWithShape,
     registry::builtin::BlockKind,
@@ -21,11 +20,9 @@ use tracing::{debug, info};
 
 use crate::{
     inv::{self, Items},
-    world::{block_at, feet, goto_timeout, me},
+    click,
+    world::{block_at, feet, goto_timeout, me, world_lock},
 };
-
-/// How far from the eyes a block may be clicked: the player's `block_interaction_range`.
-const REACH: f64 = 4.5;
 
 const DIRECTIONS: [Direction; 6] =
     [Direction::Down, Direction::Up, Direction::North, Direction::South, Direction::West, Direction::East];
@@ -48,25 +45,6 @@ fn outline_boxes(state: BlockState, pos: BlockPos) -> Vec<Aabb> {
     shape.to_aabbs().into_iter().map(|b| b.move_relative(off)).collect()
 }
 
-/// Our hitbox where we stand now.
-fn my_box(bot: &Client) -> Aabb {
-    // the position first: a component guard held while asking for another one deadlocks
-    // with azalea's writer
-    let pos = me(bot);
-    let dims = bot.component::<EntityDimensions>().ok().map(|d| d.clone());
-    match dims {
-        Some(d) => d.make_bounding_box(pos),
-        // a standing player: 0.6 wide, 1.8 high
-        None => Aabb { min: pos + Vec3::new(-0.3, 0.0, -0.3), max: pos + Vec3::new(0.3, 1.8, 0.3) },
-    }
-}
-
-fn eye(bot: &Client) -> Vec3 {
-    let h = bot.component::<EntityDimensions>().map(|d| d.eye_height as f64).unwrap_or(1.62);
-    let pos = me(bot);
-    pos + Vec3::new(0.0, h, 0.0)
-}
-
 /// One way to put a block at `target`: click `against` on `face` at `point`.
 #[derive(Clone, Copy, Debug)]
 pub struct Click {
@@ -79,8 +57,10 @@ pub struct Click {
 /// The ways to put a full block at `target`, nearest click first; none if the spot is taken
 /// or the block would be inside us.
 pub fn clicks_for(bot: &Client, target: BlockPos) -> Vec<Click> {
-    let state = block_at(bot, target);
-    if !replaceable(state) {
+    let Some(state) = world_lock(bot).read().get_block_state(target) else {
+        return Vec::new(); // not loaded: nothing known to click
+    };
+    if !replaceable(state) || !click::height_ok(bot, target.y) {
         return Vec::new();
     }
     // the new block is taken as a full cube: tables, furnaces, stone, dirt are
@@ -88,10 +68,11 @@ pub fn clicks_for(bot: &Client, target: BlockPos) -> Vec<Click> {
         min: Vec3::new(target.x as f64, target.y as f64, target.z as f64),
         max: Vec3::new(target.x as f64 + 1.0, target.y as f64 + 1.0, target.z as f64 + 1.0),
     };
-    if cube.intersects_aabb(&my_box(bot)) {
+    // the server refuses a block where an entity stands: us, a mob, another player
+    if click::entity_in(bot, &cube) {
         return Vec::new();
     }
-    let eye = eye(bot);
+    let eye = click::eye(bot);
     let mut out = Vec::new();
 
     // A replaceable block with an outline (grass) is itself clicked: the new block takes
@@ -107,8 +88,9 @@ pub fn clicks_for(bot: &Client, target: BlockPos) -> Vec<Click> {
         // `against` is the neighbour whose `face` looks at the target
         let against = target - normal(face);
         let st = block_at(bot, against);
-        if replaceable(st) {
-            continue; // a click on it would replace it, not put a block beside it
+        // a replaceable one would be replaced, not built against; a table would open
+        if replaceable(st) || !click::clickable(world_lock(bot).read().get_block_state(against)) {
+            continue;
         }
         let boxes = outline_boxes(st, against);
         if boxes.is_empty() {
@@ -125,26 +107,12 @@ pub fn clicks_for(bot: &Client, target: BlockPos) -> Vec<Click> {
             match n.y { 1 => b.max.y, -1 => b.min.y, _ => mid.y },
             match n.z { 1 => b.max.z, -1 => b.min.z, _ => mid.z },
         );
-        // a face turned away from our eyes cannot be clicked
-        let to_eye = eye - point;
-        if to_eye.x * n.x as f64 + to_eye.y * n.y as f64 + to_eye.z * n.z as f64 <= 0.0 {
-            continue;
-        }
+        // a face turned away from our eyes is clicked all the same: the server does not
+        // check the line of sight, and a top face above the eyes is the only way to stack
         out.push(Click { target, against, face, point });
     }
     out.sort_by(|a, b| a.point.distance_squared_to(eye).total_cmp(&b.point.distance_squared_to(eye)));
     out
-}
-
-/// Looks at the click's point and checks that the look really lands on that block and face
-/// (nothing in between). The hit result is the client's own ray against the outline shapes.
-async fn aim(bot: &Client, c: &Click) -> bool {
-    bot.look_at(c.point);
-    bot.wait_ticks(2).await;
-    match bot.hit_result() {
-        Ok(HitResult::Block(h)) => h.block_pos == c.against && (c.against == c.target || h.direction == c.face),
-        _ => false,
-    }
 }
 
 /// Puts a block of `items` at `target`. Walks near when out of reach.
@@ -157,17 +125,16 @@ pub async fn place_at(bot: &Client, items: &Items, target: BlockPos) -> Result<(
         if clicks.is_empty() {
             bail!("nothing to click to put a block at {target} (or it would be inside us)");
         }
-        if clicks[0].point.distance_to(eye(bot)) > REACH {
+        if click::reach_to(bot, clicks[0].against) > click::REACH {
             goto_timeout(bot, RadiusGoal::new(target.center(), 3.0), Duration::from_secs(20)).await?;
             clicks = clicks_for(bot, target);
         }
-        for c in clicks.iter().filter(|c| c.point.distance_to(eye(bot)) <= REACH) {
-            if !aim(bot, c).await {
-                debug!("click {c:?} is not in view");
+        for c in clicks.iter().filter(|c| click::reach_to(bot, c.against) <= click::REACH) {
+            inv::hold(bot, items).await;
+            if let Err(e) = click::use_item_on(bot, c.against, c.face, c.point).await {
+                debug!("click {c:?} not sent: {e}");
                 continue;
             }
-            inv::hold(bot, items).await;
-            bot.block_interact(c.against);
             for _ in 0..20 {
                 bot.wait_ticks(2).await;
                 if !replaceable(block_at(bot, target)) {
