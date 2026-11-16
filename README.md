@@ -1,5 +1,7 @@
 # Speedrun bot (Minecraft 26.3)
 
+Start with HANDOFF.md (project, status, testing, Azalea port).
+
 - `mc_speedrun/` — the bot (Rust, nightly).
 - `azalea/` — Azalea ported to Minecraft 26.3 (protocol 777): new blocks/items/registries,
   13 new item components, the new entity movement encoding (VecDelta / PositionPath),

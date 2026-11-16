@@ -21,6 +21,13 @@ pub async fn all(bot: &Client) -> Result<()> {
 }
 
 pub async fn stage(bot: &Client, name: &str) -> Result<()> {
+    crate::telemetry::record(bot, "stage_start", serde_json::json!({"stage": name}));
+    let r = stage_body(bot, name).await;
+    crate::telemetry::record(bot, "stage_end", serde_json::json!({"stage": name, "ok": r.is_ok(), "error": r.as_ref().err().map(|e| e.to_string())}));
+    r
+}
+
+async fn stage_body(bot: &Client, name: &str) -> Result<()> {
     info!("stage {name}");
     crate::world::wait_for_world(bot).await;
     bot.chat(format!("stage {name}"));

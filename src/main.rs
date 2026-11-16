@@ -8,6 +8,7 @@ mod craft;
 mod inv;
 mod obtain;
 mod place;
+mod telemetry;
 mod run;
 mod world;
 
@@ -74,12 +75,19 @@ async fn main() -> AppExit {
         }
     });
     info!("joining {} as {}", a.server, a.name);
+    match telemetry::start() {
+        Ok(path) => info!("run log: {path}"),
+        Err(e) => error!("no run log: {e}"),
+    }
     ClientBuilder::new().set_handler(handle).start(Account::offline(&a.name), a.server.as_str()).await
 }
 
 async fn handle(bot: Client, event: Event, state: State) -> eyre::Result<()> {
     let a = ARGS.get().unwrap();
     match event {
+        Event::Tick => telemetry::sample(&bot),
+        Event::Packet(p) => telemetry::packet(&bot, &p),
+        Event::Death(_) => telemetry::record(&bot, "death", serde_json::json!({})),
         Event::Spawn if a.autostart && state.task.lock().is_none() => start(&bot, &state, a.stage.clone()),
         Event::Chat(m) => {
             let (sender, content) = m.split_sender_and_content();
