@@ -101,11 +101,13 @@ pub fn obtain<'a>(bot: &'a Client, items: Items, want: i32) -> Boxed<'a> {
             bail!("no way known to get {first:?}");
         };
         let times = (want - have + recipe.yields - 1) / recipe.yields;
+        // The table first: made after the ingredients, it ate the planks set aside for a
+        // pickaxe and the craft came up short.
+        let table = if recipe.needs_table() { Some(crafting_table(bot).await?) } else { None };
         for (ingredient, per) in recipe.ingredients() {
             obtain(bot, ingredient, per * times).await?;
         }
-        if recipe.needs_table() {
-            let table = crafting_table(bot).await?;
+        if let Some(table) = table {
             world::reach(bot, table).await?;
             let Ok(Some(handle)) = bot.open_container_at(table).await else {
                 bail!("crafting table at {table} did not open");
