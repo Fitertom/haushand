@@ -22,7 +22,7 @@ use tracing::info;
 use crate::{
     craft::{self, items},
     inv::{self, Items},
-    place::{place_at, replaceable},
+    place::{place_at, place_from, replaceable},
     world::{self, block_at, kind_at},
 };
 
@@ -142,6 +142,11 @@ fn corner_items() -> Items {
     v
 }
 
+/// Blocks to pillar with: anything full but the obsidian.
+fn pillar_items() -> Items {
+    Items(corner_items().0.into_iter().filter(|&k| k != ItemKind::Obsidian).collect())
+}
+
 /// Builds a frame near the bot and returns its site. Needs 10 obsidian and 4 corner blocks.
 pub async fn build(bot: &Client) -> Result<Site> {
     if inv::count_kind(bot, ItemKind::Obsidian) < 10 {
@@ -187,12 +192,23 @@ pub async fn build(bot: &Client) -> Result<Site> {
             }
             c
         };
-        place_at(bot, &what, pos).await?;
-        // the walk back after a far click
-        if world::me(bot).distance_to(site.stand().center()) > 1.5 {
+        // A block j high goes on the top face of the one under it, which the eyes see only
+        // from above it: stand on a pillar j-1 high (the top row is clicked against the
+        // corners' sides, seen from that same height).
+        let j = pos.y - site.origin.y;
+        let need = (j - 1).clamp(0, 3);
+        while world::feet(bot).y - site.origin.y < need {
+            crate::place::pillar_up(bot, &pillar_items()).await?;
+        }
+        let on_ground = world::feet(bot).y == site.origin.y;
+        if on_ground && world::me(bot).distance_to(site.stand().center()) > 1.5 {
             let _ = world::goto_timeout(bot, BlockPosGoal(site.stand()), Duration::from_secs(15)).await;
         }
+        place_from(bot, &what, pos, on_ground).await?;
     }
+    // down again, picking the pillar up on the way
+    crate::place::pillar_down(bot, site.origin.y).await?;
+    world::collect_drops(bot, site.stand().center(), 3.0).await;
     for (pos, obsidian) in site.order() {
         if obsidian && kind_at(bot, pos) != BlockKind::Obsidian {
             bail!("the frame at {pos} is {:?}, not obsidian", kind_at(bot, pos));

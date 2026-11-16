@@ -63,7 +63,8 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
                 return Ok(());
             }
             obtain(bot, Items::one(ItemKind::FlintAndSteel), 1).await?;
-            obtain(bot, craft::stone_material(), 4).await?;
+            // 4 corners and a pillar 3 high to reach the top (the pillar comes back)
+            obtain(bot, craft::stone_material(), 7).await?;
             let site = crate::portal::build(bot).await?;
             crate::portal::light(bot, &site).await?;
             crate::portal::enter(bot, &site).await?;

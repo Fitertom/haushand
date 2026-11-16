@@ -102,12 +102,18 @@ pub fn clicks_for(bot: &Client, target: BlockPos) -> Vec<Click> {
 
 /// Puts a block of `items` at `target`. Walks near when out of reach.
 pub async fn place_at(bot: &Client, items: &Items, target: BlockPos) -> Result<()> {
+    place_from(bot, items, target, true).await
+}
+
+/// Puts a block of `items` at `target`, walking closer only when `walk` (not from the top
+/// of a pillar, where a step is a fall).
+pub async fn place_from(bot: &Client, items: &Items, target: BlockPos, walk: bool) -> Result<()> {
     if !inv::hold(bot, items).await {
         bail!("no {items:?} to place");
     }
     for attempt in 0..3 {
         let mut clicks = clicks_for(bot, target);
-        if clicks.is_empty() {
+        if clicks.is_empty() && walk {
             // no face to click seen from here: closer, then look again
             goto_timeout(bot, RadiusGoal::new(target.center(), 2.5), Duration::from_secs(20)).await?;
             clicks = clicks_for(bot, target);
@@ -191,4 +197,57 @@ pub async fn place_near(bot: &Client, items: &Items) -> Result<BlockPos> {
 pub fn describe(bot: &Client, pos: BlockPos) -> String {
     let st = block_at(bot, pos);
     format!("{:?} replaceable={} boxes={}", BlockKind::from(st), replaceable(st), outline_boxes(st, pos).len())
+}
+
+/// Climbs one block where we stand: jump, and while above the block we stood on, put one of
+/// `items` on its top face (seen from above), then land on it.
+pub async fn pillar_up(bot: &Client, items: &Items) -> Result<()> {
+    let base = feet(bot);
+    if !inv::hold(bot, items).await {
+        bail!("no {items:?} to pillar with");
+    }
+    let ground = |bot: &Client| bot.query_self::<&azalea::entity::Physics, _>(|p| p.on_ground()).unwrap_or(false);
+    for _ in 0..10 {
+        if ground(bot) {
+            break;
+        }
+        bot.wait_ticks(1).await;
+    }
+    bot.jump();
+    // up past the top of the block about to go in: the block must not meet our feet
+    let mut high = false;
+    for _ in 0..12 {
+        bot.wait_ticks(1).await;
+        if me(bot).y >= base.y as f64 + 1.1 {
+            high = true;
+            break;
+        }
+    }
+    if !high {
+        bail!("jumped but did not get above {base}");
+    }
+    place_from(bot, items, base, false).await?;
+    for _ in 0..20 {
+        bot.wait_ticks(1).await;
+        if ground(bot) && feet(bot).y == base.y + 1 {
+            return Ok(());
+        }
+    }
+    bail!("did not land on the pillar at {base}")
+}
+
+/// Comes down a pillar to stand at `y`: the block under our feet dug (its top face seen from
+/// above), one at a time.
+pub async fn pillar_down(bot: &Client, y: i32) -> Result<()> {
+    while feet(bot).y > y {
+        let under = feet(bot).down(1);
+        crate::dig::dig(bot, under).await?;
+        for _ in 0..20 {
+            bot.wait_ticks(1).await;
+            if feet(bot).y <= under.y && bot.query_self::<&azalea::entity::Physics, _>(|p| p.on_ground()).unwrap_or(false) {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
