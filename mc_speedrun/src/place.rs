@@ -109,6 +109,16 @@ pub async fn place_at(bot: &Client, items: &Items, target: BlockPos) -> Result<(
 /// of a pillar, where a step is a fall).
 pub async fn place_from(bot: &Client, items: &Items, target: BlockPos, walk: bool) -> Result<()> {
     if !inv::hold(bot, items).await {
+        // what the client believes it has: a stale menu after a container closed shows here
+        let slots = inv::player_slots(bot);
+        let (id, open) = bot
+            .query_self::<&azalea::entity::inventory::Inventory, _>(|i| (i.id, i.container_menu.is_some()))
+            .unwrap_or((-1, false));
+        let have: Vec<String> = inv::STORAGE
+            .filter(|&i| !slots[i].is_empty())
+            .map(|i| format!("{i}:{:?}x{}", slots[i].kind(), slots[i].count()))
+            .collect();
+        info!("hold {items:?} failed; menu id {id} (container open: {open}); slots {}", have.join(" "));
         bail!("no {items:?} to place");
     }
     for attempt in 0..3 {
