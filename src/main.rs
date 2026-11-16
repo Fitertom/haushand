@@ -7,6 +7,7 @@
 mod craft;
 mod inv;
 mod obtain;
+mod place;
 mod run;
 mod world;
 
@@ -27,10 +28,12 @@ struct Args {
     name: String,
     owner: Option<String>,
     autostart: bool,
+    /// Run only this stage on spawn (testing without chat).
+    stage: Option<String>,
 }
 
 fn args() -> Args {
-    let mut a = Args { server: "localhost".into(), name: "SpeedBot".into(), owner: None, autostart: false };
+    let mut a = Args { server: "localhost".into(), name: "SpeedBot".into(), owner: None, autostart: false, stage: None };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         match k.as_str() {
@@ -38,6 +41,10 @@ fn args() -> Args {
             "--name" => a.name = it.next().expect("--name needs a value"),
             "--owner" => a.owner = it.next(),
             "--go" => a.autostart = true,
+            "--stage" => {
+                a.autostart = true;
+                a.stage = it.next();
+            }
             other => panic!("unknown argument {other}"),
         }
     }
@@ -55,6 +62,17 @@ async fn main() -> AppExit {
         )
         .init();
     let a = ARGS.get_or_init(args);
+    // A frozen client stops answering keep-alives and is kicked a minute later; print who
+    // holds which lock when that happens.
+    std::thread::spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        for (i, threads) in parking_lot::deadlock::check_deadlock().iter().enumerate() {
+            error!("deadlock #{i}");
+            for t in threads {
+                error!("thread {:?}:\n{:?}", t.thread_id(), t.backtrace());
+            }
+        }
+    });
     info!("joining {} as {}", a.server, a.name);
     ClientBuilder::new().set_handler(handle).start(Account::offline(&a.name), a.server.as_str()).await
 }
@@ -62,7 +80,7 @@ async fn main() -> AppExit {
 async fn handle(bot: Client, event: Event, state: State) -> eyre::Result<()> {
     let a = ARGS.get().unwrap();
     match event {
-        Event::Spawn if a.autostart && state.task.lock().is_none() => start(&bot, &state, None),
+        Event::Spawn if a.autostart && state.task.lock().is_none() => start(&bot, &state, a.stage.clone()),
         Event::Chat(m) => {
             let (sender, content) = m.split_sender_and_content();
             let Some(sender) = sender else { return Ok(()) };
@@ -83,9 +101,8 @@ async fn handle(bot: Client, event: Event, state: State) -> eyre::Result<()> {
                 }
                 Some("!pos") => bot.chat(format!("{}", world::feet(&bot))),
                 Some("!inv") => {
-                    let menu = inv::player_menu(&bot);
+                    let menu = inv::player_slots(&bot);
                     let list: Vec<String> = menu
-                        .slots()
                         .iter()
                         .filter(|s| s.is_present())
                         .map(|s| format!("{:?}x{}", s.kind(), s.count()))

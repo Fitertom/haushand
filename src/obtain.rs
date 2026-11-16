@@ -129,7 +129,7 @@ async fn crafting_table(bot: &Client) -> Result<BlockPos> {
         return Ok(pos);
     }
     obtain(bot, items!(CraftingTable), 1).await?;
-    world::place_beside(bot, &items!(CraftingTable)).await
+    crate::place::place_near(bot, &items!(CraftingTable)).await
 }
 
 async fn furnace(bot: &Client) -> Result<BlockPos> {
@@ -140,7 +140,7 @@ async fn furnace(bot: &Client) -> Result<BlockPos> {
         return Ok(pos);
     }
     obtain(bot, items!(Furnace), 1).await?;
-    world::place_beside(bot, &items!(Furnace)).await
+    crate::place::place_near(bot, &items!(Furnace)).await
 }
 
 fn fuel() -> Items {
@@ -215,8 +215,7 @@ pub async fn hotbar_tools(bot: &Client) {
         [DiamondSword, IronSword, StoneSword, WoodenSword],
     ];
     for (hotbar, group) in tools.iter().enumerate() {
-        let menu = inv::player_menu(bot);
-        let slots = menu.slots();
+        let slots = inv::player_slots(bot);
         let Some(best) = group.iter().find(|&&k| inv::count_kind(bot, k) > 0) else { continue };
         if slots[36 + hotbar].kind() == *best {
             continue;

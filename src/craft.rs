@@ -75,6 +75,9 @@ pub async fn craft(bot: &Client, recipe: &Recipe, times: i32, table: Option<&aza
                 &own
             }
         };
+        // leftovers from an earlier failed craft would change the recipe in the grid
+        clear_grid(bot, menu_handle, width).await;
+        settle_menu(bot).await;
         for (r, row) in recipe.pattern.iter().enumerate() {
             for (c, ch) in row.chars().enumerate() {
                 if ch == ' ' {
@@ -82,8 +85,10 @@ pub async fn craft(bot: &Client, recipe: &Recipe, times: i32, table: Option<&aza
                 }
                 let cell = 1 + r * width + c;
                 let mut need = round;
-                // Sources are read from the menu before each cell: the clicks before changed it.
-                bot.wait_ticks(1).await;
+                // Sources are read from the menu before each cell, once the server has answered
+                // the clicks before: its answers come late and overwrite what the client
+                // predicted, and a source read too early was a stack already moved.
+                settle_menu(bot).await;
                 for (slot, _, n) in inv::slots_of(bot, recipe.ingredient(ch)) {
                     if need == 0 {
                         break;
@@ -97,15 +102,40 @@ pub async fn craft(bot: &Client, recipe: &Recipe, times: i32, table: Option<&aza
                     need -= take;
                 }
                 if need > 0 {
+                    let menu = menu_handle.menu().ok().flatten();
+                    info!(
+                        "short of {:?} at cell {cell}: player menu {:?}; open menu {:?}",
+                        recipe.ingredient(ch).0.first(),
+                        inv::slots_of(bot, recipe.ingredient(ch)),
+                        menu.map(|m| m.slots().iter().enumerate().filter(|(_, s)| s.is_present()).map(|(i, s)| (i, s.kind(), s.count())).collect::<Vec<_>>())
+                    );
                     clear_grid(bot, menu_handle, width).await;
                     bail!("not enough {:?} for {}", recipe.ingredient(ch), recipe.name);
                 }
             }
         }
-        bot.wait_ticks(2).await;
+        // The result is the server's: wait until it shows in slot 0 (a fixed wait was too
+        // short once the server ran three times faster).
+        let mut ready = false;
+        for _ in 0..40 {
+            bot.wait_ticks(2).await;
+            if menu_handle.menu().ok().flatten().is_some_and(|m| m.slots().first().is_some_and(|s| s.is_present())) {
+                ready = true;
+                break;
+            }
+        }
+        if !ready {
+            clear_grid(bot, menu_handle, width).await;
+            bail!("no result for {} in the grid", recipe.name);
+        }
         // Shift-click on the result takes every craft the grid allows into the inventory.
         menu_handle.shift_click(0usize);
-        bot.wait_ticks(3).await;
+        for _ in 0..20 {
+            bot.wait_ticks(2).await;
+            if inv::count(bot, &recipe.output) > before {
+                break;
+            }
+        }
         clear_grid(bot, menu_handle, width).await;
         let got = inv::count(bot, &recipe.output) - before;
         info!("crafted {} ×{} (+{got})", recipe.name, round);
@@ -115,6 +145,27 @@ pub async fn craft(bot: &Client, recipe: &Recipe, times: i32, table: Option<&aza
         left -= round;
     }
     Ok(())
+}
+
+/// Waits until the menu's state id has not changed for a few ticks: the server has answered
+/// every click sent.
+async fn settle_menu(bot: &Client) {
+    let state = |bot: &Client| bot.query_self::<&azalea::entity::inventory::Inventory, _>(|i| i.state_id).ok();
+    let mut last = state(bot);
+    let mut still = 0;
+    for _ in 0..40 {
+        bot.wait_ticks(1).await;
+        let now = state(bot);
+        if now == last {
+            still += 1;
+            if still >= 3 {
+                return;
+            }
+        } else {
+            still = 0;
+            last = now;
+        }
+    }
 }
 
 /// Anything left in the grid goes back into the inventory, or it would be crafted next time.

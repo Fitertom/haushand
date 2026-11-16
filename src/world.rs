@@ -6,7 +6,6 @@ use std::time::Duration;
 use azalea::{
     BlockPos, Client, Vec3,
     block::{BlockState, BlockStates},
-    core::direction::Direction,
     entity::{Position, metadata},
     pathfinder::goals::{BlockPosGoal, RadiusGoal, ReachBlockPosGoal},
     ecs::query::With,
@@ -45,11 +44,14 @@ pub fn feet(bot: &Client) -> BlockPos {
 
 /// Nearest loaded blocks of `states`, skipping `avoid`, up to `max` of them.
 pub fn find_blocks(bot: &Client, states: &BlockStates, max: usize, avoid: &[BlockPos]) -> Vec<BlockPos> {
-    let world = world_lock(bot);
-    let world = world.read();
-    let mut found: Vec<BlockPos> =
-        world.find_blocks(me(bot), states).filter(|p| !avoid.contains(p)).take(max * 4).collect();
+    // Our position first, the world's lock after: holding the world while asking the ECS
+    // for it inverted azalea's lock order (the ECS, then the world) and froze the client.
     let me = me(bot);
+    let mut found: Vec<BlockPos> = {
+        let world = world_lock(bot);
+        let world = world.read();
+        world.find_blocks(me, states).filter(|p| !avoid.contains(p)).take(max * 4).collect()
+    };
     // find_blocks sorts by x+y+z distance; the walk is by true distance.
     found.sort_by(|a, b| a.center().distance_squared_to(me).total_cmp(&b.center().distance_squared_to(me)));
     found.truncate(max);
@@ -60,7 +62,19 @@ pub fn find_blocks(bot: &Client, states: &BlockStates, max: usize, avoid: &[Bloc
 pub async fn reach(bot: &Client, pos: BlockPos) -> Result<()> {
     let chunks = world_lock(bot).read().chunks.clone();
     let goal = ReachBlockPosGoal::new(pos, chunks);
-    goto_timeout(bot, goal, Duration::from_secs(90)).await
+    let from = me(bot);
+    // time by the distance: half a second a block walked, ten at least
+    let secs = 10.0 + from.distance_to(pos.center()) * 0.5;
+    let r = goto_timeout(bot, goal, Duration::from_secs_f64(secs)).await;
+    if r.is_err() {
+        info!(
+            "reach {pos} failed: walked {:.1} of {:.1} blocks in {secs:.0}s, now {:.1} away",
+            from.distance_to(me(bot)),
+            from.distance_to(pos.center()),
+            me(bot).distance_to(pos.center())
+        );
+    }
+    r
 }
 
 /// `goto` with a deadline: a path that never ends (a goal walled off) must not hang a run.
@@ -96,17 +110,29 @@ pub async fn mine_at(bot: &Client, pos: BlockPos) -> Result<()> {
     Ok(())
 }
 
+/// Dropped items within `radius` of `around`, nearest first.
+///
+/// One query under one lock: azalea's `nearest_entities_by` reads our position while
+/// already holding the ECS lock, and froze the client the first time it was called.
+pub fn drops_near(bot: &Client, around: Vec3, radius: f64) -> Vec<Vec3> {
+    let world_name = bot.component::<azalea::world::WorldName>().ok().map(|w| w.clone());
+    let Some(world_name) = world_name else { return Vec::new() };
+    let mut ecs = bot.ecs.write();
+    let mut query = ecs.query_filtered::<(&Position, &azalea::world::WorldName), With<metadata::Item>>();
+    let mut found: Vec<Vec3> = query
+        .iter(&ecs)
+        .filter(|(_, w)| **w == world_name)
+        .map(|(p, _)| **p)
+        .filter(|p| p.distance_squared_to(around) < radius * radius)
+        .collect();
+    found.sort_by(|a, b| a.distance_squared_to(around).total_cmp(&b.distance_squared_to(around)));
+    found
+}
+
 /// Walks onto every dropped item within `radius` of `around`.
 pub async fn collect_drops(bot: &Client, around: Vec3, radius: f64) {
     for _ in 0..8 {
-        let drops: Vec<Vec3> = bot
-            .nearest_entities_by::<&Position, With<metadata::Item>>(|_: &Position| true)
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|e| e.position().ok())
-            .filter(|p| p.distance_squared_to(around) < radius * radius)
-            .collect();
-        let Some(&target) = drops.first() else { return };
+        let Some(&target) = drops_near(bot, around, radius).first() else { return };
         debug!("picking up item at {target}");
         if goto_timeout(bot, RadiusGoal::new(target, 0.8), Duration::from_secs(10)).await.is_err() {
             return;
@@ -115,13 +141,65 @@ pub async fn collect_drops(bot: &Client, around: Vec3, radius: f64) {
     }
 }
 
-/// Mines blocks of `states` until `items` count reaches `want`. Fails when none is in view.
+/// How far `pos` stands above the ground under it: the first block down that is neither air,
+/// a log nor leaves. A log higher than the reach from the ground is in a crown the path
+/// cannot climb to (it places no blocks), and chasing it times out.
+pub fn height_above_ground(bot: &Client, pos: BlockPos) -> i32 {
+    for d in 1..24 {
+        let below = pos.down(d);
+        let state = block_at(bot, below);
+        let name = format!("{:?}", BlockKind::from(state));
+        if !state.is_air() && !name.ends_with("Log") && !name.ends_with("Leaves") && !name.ends_with("Wood") {
+            return d - 1;
+        }
+    }
+    24
+}
+
+/// Walks outward in a widening square until a block of `states` is loaded, and returns the
+/// nearest one. A spawn in a desert or on an ocean shore has no tree in view.
+pub async fn find_or_explore(bot: &Client, states: &BlockStates, avoid: &[BlockPos]) -> Result<BlockPos> {
+    let start = feet(bot);
+    // what stands out of reach from the ground is skipped, as if it were not there
+    let reachable = |bot: &Client| -> Option<BlockPos> {
+        find_blocks(bot, states, 16, avoid).into_iter().find(|&p| height_above_ground(bot, p) <= 3)
+    };
+    // eight legs of a widening spiral, then give up: 8 × 64 blocks is far past any biome
+    let dirs = [(1, 0), (0, 1), (-1, 0), (0, -1)];
+    for leg in 0..12 {
+        if let Some(pos) = reachable(bot) {
+            return Ok(pos);
+        }
+        let (dx, dz) = dirs[leg % 4];
+        let reach = 32 * (leg as i32 / 2 + 1);
+        let target = azalea::pathfinder::goals::XZGoal { x: start.x + dx * reach, z: start.z + dz * reach };
+        info!("nothing in view, exploring towards {} {}", target.x, target.z);
+        // a short walk at a time, looking again after each
+        let _ = goto_timeout(bot, target, Duration::from_secs(25)).await;
+        bot.wait_ticks(20).await;
+    }
+    bail!("explored and found none")
+}
+
+/// Waits until the chunk under the bot and its neighbours are loaded.
+pub async fn wait_for_world(bot: &Client) {
+    for _ in 0..200 {
+        let f = feet(bot);
+        let loaded = [(0, 0), (16, 0), (-16, 0), (0, 16), (0, -16)].iter().all(|(dx, dz)| {
+            world_lock(bot).read().chunks.get(&azalea::core::position::ChunkPos::from(BlockPos::new(f.x + dx, f.y, f.z + dz))).is_some()
+        });
+        if loaded && f.y != 0 {
+            return;
+        }
+        bot.wait_ticks(5).await;
+    }
+}
+
+/// Mines blocks of `states` until `items` count reaches `want`, exploring when none is near.
 pub async fn mine_until(bot: &Client, states: &BlockStates, items: &Items, want: i32) -> Result<()> {
     let mut failed: Vec<BlockPos> = Vec::new();
     while inv::count(bot, items) < want {
-        let Some(&pos) = find_blocks(bot, states, 1, &failed).first() else {
-            bail!("no block to mine for {items:?} in loaded chunks");
-        };
+        let pos = find_or_explore(bot, states, &failed).await?;
         info!("mining {:?} at {pos} ({}/{want})", kind_at(bot, pos), inv::count(bot, items));
         if let Err(e) = mine_at(bot, pos).await {
             info!("could not mine {pos}: {e}");
@@ -132,52 +210,6 @@ pub async fn mine_until(bot: &Client, states: &BlockStates, items: &Items, want:
         }
     }
     Ok(())
-}
-
-/// Places the held block onto the `face` of `against`. The block appears at
-/// `against.offset(face)`.
-pub async fn place_against(bot: &Client, against: BlockPos, face: Direction) -> Result<()> {
-    let n = face.normal();
-    let target = against.center() + Vec3::new(n.x as f64 * 0.5, n.y as f64 * 0.5, n.z as f64 * 0.5);
-    bot.look_at(target);
-    bot.wait_ticks(2).await;
-    bot.block_interact(against);
-    bot.wait_ticks(3).await;
-    let placed = against + n;
-    if block_at(bot, placed).is_air() {
-        bail!("placing at {placed} did nothing");
-    }
-    Ok(())
-}
-
-/// A free spot beside the bot with solid ground under it, to put a block (a crafting
-/// table, a furnace) on.
-pub fn spot_beside(bot: &Client) -> Option<BlockPos> {
-    let f = feet(bot);
-    let around = [f.north(1), f.south(1), f.east(1), f.west(1), f.north(1).east(1), f.south(1).west(1)];
-    around.into_iter().find(|&p| {
-        block_at(bot, p).is_air() && block_at(bot, p.up(1)).is_air() && !block_at(bot, p.down(1)).is_air()
-    })
-}
-
-/// Puts a block of `items` down beside the bot and returns where.
-pub async fn place_beside(bot: &Client, items: &Items) -> Result<BlockPos> {
-    if !inv::hold(bot, items).await {
-        bail!("no {items:?} to place");
-    }
-    let spot = match spot_beside(bot) {
-        Some(s) => s,
-        None => {
-            // Boxed in: clear the block in front at head height and use the floor there.
-            let f = feet(bot).north(1);
-            mine_at(bot, f).await?;
-            mine_at(bot, f.up(1)).await?;
-            inv::hold(bot, items).await;
-            f
-        }
-    };
-    place_against(bot, spot.down(1), Direction::Up).await?;
-    Ok(spot)
 }
 
 /// Stands still on the spot for a moment so the server and client agree on where we are.

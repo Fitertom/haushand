@@ -29,6 +29,32 @@ impl From<ItemKind> for Items {
     }
 }
 
+/// The player's slots in player-menu numbering (0-45), read from whatever menu is open.
+///
+/// With a container open azalea updates the player's slots inside the container's menu and
+/// the inventory menu only when it closes: counted from the inventory menu, a pickaxe
+/// shift-clicked out of a crafting table was not there, and the craft "gave nothing".
+pub fn player_slots(bot: &Client) -> Vec<ItemStack> {
+    bot.query_self::<&azalea::entity::inventory::Inventory, _>(|inv| {
+        let mut slots = inv.inventory_menu.slots();
+        if inv.id != 0
+            && let Some(open) = &inv.container_menu
+        {
+            let theirs = open.slots();
+            // the container's last 36 slots are the player's main rows then the hotbar,
+            // the same order as player-menu slots 9..45
+            let start = theirs.len() - 36;
+            for i in 0..36 {
+                slots[9 + i] = theirs[start + i].clone();
+            }
+        }
+        slots
+    })
+    .expect("bot has no inventory")
+}
+
+/// The player's own menu as last synced (for code that wants a `Menu`).
+#[allow(dead_code)]
 pub fn player_menu(bot: &Client) -> Menu {
     bot.query_self::<&azalea::entity::inventory::Inventory, _>(|inv| inv.inventory_menu.clone())
         .expect("bot has no inventory")
@@ -39,8 +65,7 @@ pub const STORAGE: std::ops::Range<usize> = 9..45;
 pub const HOTBAR: std::ops::Range<usize> = 36..45;
 
 pub fn count(bot: &Client, items: &Items) -> i32 {
-    let menu = player_menu(bot);
-    let slots = menu.slots();
+    let slots = player_slots(bot);
     STORAGE
         .chain(45..46)
         .filter_map(|i| slots.get(i))
@@ -55,8 +80,7 @@ pub fn count_kind(bot: &Client, kind: ItemKind) -> i32 {
 
 /// Player-menu slots holding any of `items`, largest stack first.
 pub fn slots_of(bot: &Client, items: &Items) -> Vec<(usize, ItemKind, i32)> {
-    let menu = player_menu(bot);
-    let slots = menu.slots();
+    let slots = player_slots(bot);
     let mut found: Vec<_> = STORAGE
         .filter(|&i| items.contains(slots[i].kind()) && slots[i].count() > 0)
         .map(|i| (i, slots[i].kind(), slots[i].count()))
@@ -66,8 +90,7 @@ pub fn slots_of(bot: &Client, items: &Items) -> Vec<(usize, ItemKind, i32)> {
 }
 
 pub fn free_slots(bot: &Client) -> usize {
-    let menu = player_menu(bot);
-    let slots = menu.slots();
+    let slots = player_slots(bot);
     STORAGE.filter(|&i| slots[i].is_empty()).count()
 }
 
@@ -80,8 +103,7 @@ pub fn player_slot_in(container_slots: usize, player_slot: usize) -> usize {
 
 /// Puts an item of `items` into the hotbar and selects it. Returns false when there is none.
 pub async fn hold(bot: &Client, items: &Items) -> bool {
-    let menu = player_menu(bot);
-    let slots = menu.slots();
+    let slots = player_slots(bot);
     if let Some(i) = HOTBAR.clone().find(|&i| items.contains(slots[i].kind())) {
         bot.set_selected_hotbar_slot((i - 36) as u8);
         bot.wait_updates(1).await;
