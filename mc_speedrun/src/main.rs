@@ -240,8 +240,11 @@ fn on_death(bot: &Client, state: &State) {
     // the new task takes the run's place at once, so the respawn's Spawn event does not
     // autostart a second run beside it
     *task = Some(tokio::spawn(async move {
-        survival::after_death(&bot, pos).await;
+        survival::respawn_and_settle(&bot).await;
+        // alive again: the next death is a new one, handled from the top (it aborts this
+        // task, the walk back included)
         HANDLING.store(false, std::sync::atomic::Ordering::SeqCst);
+        survival::fetch_drops(&bot, pos).await;
         if let Some(stage) = last {
             info!("resuming {} after death", stage.as_deref().unwrap_or("the run"));
             run_task(bot, stage).await;

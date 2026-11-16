@@ -484,15 +484,19 @@ pub async fn respawn(bot: &Client) -> bool {
     combat::alive(bot)
 }
 
-/// Respawns after a death (our own request, azalea's auto-respawn is off), waits for the
-/// world around the new spawn, then walks back for what we dropped when it is not far.
-pub async fn after_death(bot: &Client, died_at: Option<Vec3>) {
+/// Respawns after a death (our own request, azalea's auto-respawn is off) and waits for
+/// the world around the new spawn.
+pub async fn respawn_and_settle(bot: &Client) {
     // the death screen comes with the kill packet; health 0 may land a tick before it
     bot.wait_ticks(2).await;
     respawn(bot).await;
     // the respawn moves us; wait until the position settles in loaded chunks
     bot.wait_ticks(20).await;
     world::wait_for_world(bot).await;
+}
+
+/// Walks back for what we dropped at `died_at` when it is not far.
+pub async fn fetch_drops(bot: &Client, died_at: Option<Vec3>) {
     let Some(at) = died_at else { return };
     let here = world::me(bot);
     let lava_there = (-1..=1).any(|dy| world::kind_at(bot, BlockPos::from(at).up(dy)) == BlockKind::Lava);
