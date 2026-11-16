@@ -6,6 +6,7 @@
 
 mod craft;
 mod inv;
+mod mine;
 mod obtain;
 mod place;
 mod telemetry;
