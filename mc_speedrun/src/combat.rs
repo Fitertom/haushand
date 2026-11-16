@@ -581,7 +581,9 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
         let Some(m) = mob(bot, target) else {
             let exists = bot.ecs.read().get_entity(target).is_ok();
             info!("fight: {last_kind:?} no longer seen (entity {}), last at {:.1} blocks", if exists { "still there" } else { "removed" }, last_pos.distance_to(crate::world::me(bot)));
-            break if last_pos.distance_to(crate::world::me(bot)) < 8.0 { Outcome::Killed } else { Outcome::Gone };
+            // only a removed entity counts as dead: one that is still there merely left our
+            // view (never count an unhit mob as killed)
+            break if !exists && last_pos.distance_to(crate::world::me(bot)) < 8.0 { Outcome::Killed } else { Outcome::Gone };
         };
         last_kind = m.kind;
         let now = bot.ticks_connected();
