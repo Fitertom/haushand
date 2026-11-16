@@ -14,7 +14,7 @@ use azalea_inventory::{
 use azalea_physics::collision::BlockWithShape;
 use azalea_protocol::packets::game::ClientboundGamePacket;
 use bevy_app::{App, Plugin, Update};
-use bevy_ecs::{component::Component, prelude::MessageReader, system::Commands};
+use bevy_ecs::{component::Component, prelude::MessageReader, system::{Commands, Query}};
 use derive_more::Deref;
 
 use crate::{Client, client_impl::error::AzaleaResult};
@@ -335,13 +335,16 @@ pub struct WaitingForInventoryOpen;
 pub fn handle_menu_opened_event(
     mut commands: Commands,
     mut events: MessageReader<ReceiveGamePacketEvent>,
+    inventories: Query<&Inventory>,
 ) {
     for event in events.read() {
-        // Only a container's own contents mean it opened: the server also resends the
-        // player's inventory (id 0) after a craft, and taking that as the open made
-        // `open_container_at` return None at once when it came just after a click.
+        // Only the open container's own contents mean it opened: the server also resends
+        // the player's inventory (id 0) after a craft, and a container closed a moment ago
+        // can still get its contents; taking either as the open made `open_container_at`
+        // return None at once.
         if let ClientboundGamePacket::ContainerSetContent(p) = event.packet.as_ref()
             && p.container_id != 0
+            && inventories.get(event.entity).is_ok_and(|i| i.id == p.container_id)
         {
             commands
                 .entity(event.entity)

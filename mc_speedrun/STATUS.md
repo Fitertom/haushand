@@ -14,7 +14,7 @@
   bucket, iron sword. ~64 s real at ×3.
 - Knowledge base + planner (agent-built): `cargo run --example plan -- minecraft:pink_terracotta 4`,
   7 unit tests pass (`cargo test --lib`).
-- Telemetry log written per run (`runs/*.jsonl`); report page NOT written yet.
+- Telemetry log written per run (`runs/*.jsonl`); report page: `python3 tools/report.py`.
 
 Tested only in **peaceful, permanent day** (set via RCON) — no combat yet.
 
@@ -27,7 +27,7 @@ Tested only in **peaceful, permanent day** (set via RCON) — no combat yet.
 
 ## Next, in order
 
-1. **Report page** from `runs/*.jsonl`: splits per stage in game ticks/IGT, top-down path
+1. [x] **Report page** (`tools/report.py`, see TESTING.md) from `runs/*.jsonl`: splits per stage in game ticks/IGT, top-down path
    per dimension, hp/food over time, advancements timeline. Owner asked for this.
 2. **Wire the planner** (`knowledge.rs`) into `obtain.rs`/`craft.rs`, replacing the hand
    tables; map item id strings ↔ Azalea `ItemKind`.

@@ -68,9 +68,9 @@ pub async fn craft(bot: &Client, recipe: &Recipe, times: i32, table: Option<&aza
         let menu_handle: &azalea::container::ContainerHandleRef = match table {
             Some(t) => t,
             None => {
-                own = match bot.open_inventory() {
-                    Ok(Some(h)) => h,
-                    _ => bail!("another container is open"),
+                own = match open_own_inventory(bot).await {
+                    Some(h) => h,
+                    None => bail!("another container is open"),
                 };
                 &own
             }
@@ -145,6 +145,23 @@ pub async fn craft(bot: &Client, recipe: &Recipe, times: i32, table: Option<&aza
         left -= round;
     }
     Ok(())
+}
+
+/// The player's own inventory as a handle. A container left open (seen once after
+/// smelting: the furnace's id still current) is closed first, with a log line saying which.
+pub async fn open_own_inventory(bot: &Client) -> Option<azalea::container::ContainerHandle> {
+    for attempt in 0..3 {
+        if let Ok(Some(h)) = bot.open_inventory() {
+            return Some(h);
+        }
+        let open = bot.query_self::<&azalea::entity::inventory::Inventory, _>(|i| (i.id, i.container_menu.as_ref().map(|m| format!("{:?}", std::mem::discriminant(m))))).ok();
+        info!("inventory busy (attempt {attempt}): open container {open:?}; closing it");
+        if let Ok(h) = bot.get_inventory() {
+            h.close();
+        }
+        bot.wait_ticks(2).await;
+    }
+    None
 }
 
 /// Waits until the menu's state id has not changed for a few ticks: the server has answered

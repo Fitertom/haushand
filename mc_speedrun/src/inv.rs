@@ -115,7 +115,7 @@ pub async fn hold(bot: &Client, items: &Items) -> bool {
     // Swap it into the selected hotbar slot: a hotbar-swap click moves it in one packet,
     // whatever was there goes back where the item came from.
     let target = bot.selected_hotbar_slot().unwrap_or(0);
-    if let Ok(Some(inv)) = bot.open_inventory() {
+    if let Some(inv) = crate::craft::open_own_inventory(bot).await {
         inv.click(azalea::inventory::operations::SwapClick {
             source_slot: from as u16,
             target_slot: target,

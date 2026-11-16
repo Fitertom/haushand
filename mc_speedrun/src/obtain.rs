@@ -102,19 +102,34 @@ pub fn obtain<'a>(bot: &'a Client, items: Items, want: i32) -> Boxed<'a> {
         };
         let times = (want - have + recipe.yields - 1) / recipe.yields;
         // The table first: made after the ingredients, it ate the planks set aside for a
-        // pickaxe and the craft came up short.
-        let table = if recipe.needs_table() { Some(crafting_table(bot).await?) } else { None };
-        for (ingredient, per) in recipe.ingredients() {
-            obtain(bot, ingredient, per * times).await?;
+        // pickaxe and the craft came up short. It is carried (picked up after use), so
+        // having one means one in the inventory or one standing right here.
+        if recipe.needs_table() && near_station(bot, BlockKind::CraftingTable).is_none() {
+            obtain(bot, items!(CraftingTable), 1).await?;
         }
-        if let Some(table) = table {
-            world::reach(bot, table).await?;
+        // Again until all are there at once: getting a later ingredient can use up an earlier
+        // one (the sticks for a pickaxe are made from the planks counted for its head).
+        for round in 0.. {
+            for (ingredient, per) in recipe.ingredients() {
+                obtain(bot, ingredient, per * times).await?;
+            }
+            if recipe.ingredients().iter().all(|(i, per)| inv::count(bot, i) >= per * times) {
+                break;
+            }
+            if round == 3 {
+                bail!("ingredients for {} keep running out", recipe.name);
+            }
+        }
+        if recipe.needs_table() {
+            let table = station(bot, BlockKind::CraftingTable, &items!(CraftingTable)).await?;
             let Ok(Some(handle)) = bot.open_container_at(table).await else {
                 bail!("crafting table at {table} did not open");
             };
-            craft::craft(bot, &recipe, times, Some(&handle)).await?;
+            let r = craft::craft(bot, &recipe, times, Some(&handle)).await;
             drop(handle);
             bot.wait_ticks(2).await;
+            pick_up(bot, table, &items!(CraftingTable)).await;
+            r?;
         } else {
             craft::craft(bot, &recipe, times, None).await?;
         }
@@ -122,27 +137,41 @@ pub fn obtain<'a>(bot: &'a Client, items: Items, want: i32) -> Boxed<'a> {
     })
 }
 
-/// A crafting table within reach of a short walk: one already standing, or one made and put down.
-async fn crafting_table(bot: &Client) -> Result<BlockPos> {
-    let states = world::states_of(&[BlockKind::CraftingTable]);
-    if let Some(&pos) = world::find_blocks(bot, &states, 1, &[]).first()
-        && pos.center().distance_to(world::me(bot)) < 24.0
-    {
-        return Ok(pos);
-    }
-    obtain(bot, items!(CraftingTable), 1).await?;
-    crate::place::place_near(bot, &items!(CraftingTable)).await
+/// A standing `kind` (crafting table, furnace) close enough to use without a walk worth
+/// the name. Farther ones are left: walking back to one, out of a pit just dug, timed out.
+fn near_station(bot: &Client, kind: BlockKind) -> Option<BlockPos> {
+    let states = world::states_of(&[kind]);
+    world::find_blocks(bot, &states, 1, &[]).first().copied().filter(|p| p.center().distance_to(world::me(bot)) < 5.0)
 }
 
-async fn furnace(bot: &Client) -> Result<BlockPos> {
-    let states = world::states_of(&[BlockKind::Furnace]);
-    if let Some(&pos) = world::find_blocks(bot, &states, 1, &[]).first()
-        && pos.center().distance_to(world::me(bot)) < 24.0
-    {
-        return Ok(pos);
+/// A `kind` station to use right here: one standing near, or ours put down (the item must
+/// be in the inventory). Walks within reach of it.
+async fn station(bot: &Client, kind: BlockKind, item: &Items) -> Result<BlockPos> {
+    let pos = match near_station(bot, kind) {
+        Some(p) => p,
+        None => crate::place::place_near(bot, item).await?,
+    };
+    world::reach(bot, pos).await?;
+    Ok(pos)
+}
+
+/// Mines a station we put down and picks it up, to carry it to where it is needed next.
+/// A failure only costs a new one later, so it is logged and not returned.
+async fn pick_up(bot: &Client, pos: BlockPos, item: &Items) {
+    let before = inv::count(bot, item);
+    if let Err(e) = world::mine_at(bot, pos).await {
+        info!("could not pick up {item:?} at {pos}: {e}");
+        return;
     }
-    obtain(bot, items!(Furnace), 1).await?;
-    crate::place::place_near(bot, &items!(Furnace)).await
+    // the drop reaches the inventory a few ticks after it is walked over
+    for _ in 0..20 {
+        if inv::count(bot, item) > before {
+            return;
+        }
+        bot.wait_ticks(2).await;
+        world::collect_drops(bot, pos.center(), 8.0).await;
+    }
+    info!("picked {item:?} at {pos} but it did not come back");
 }
 
 fn fuel() -> Items {
@@ -154,6 +183,10 @@ fn fuel() -> Items {
 
 /// Smelts `n` of `input` into `output` in a furnace, fuelled by coal or wood.
 async fn smelt(bot: &Client, input: &Items, output: &Items, n: i32) -> Result<()> {
+    // The furnace before the fuel: making it can take a table, made of the fuel's planks.
+    if near_station(bot, BlockKind::Furnace).is_none() {
+        obtain(bot, items!(Furnace), 1).await?;
+    }
     // A coal smelts 8, a plank 1.5: take coal when there is any, else planks.
     let fuel_items = fuel();
     if inv::count(bot, &items!(Coal, Charcoal)) * 8 < n {
@@ -162,8 +195,7 @@ async fn smelt(bot: &Client, input: &Items, output: &Items, n: i32) -> Result<()
             obtain(bot, craft::planks(), planks_needed).await?;
         }
     }
-    let pos = furnace(bot).await?;
-    world::reach(bot, pos).await?;
+    let pos = station(bot, BlockKind::Furnace, &items!(Furnace)).await?;
     let Ok(Some(handle)) = bot.open_container_at(pos).await else {
         bail!("furnace at {pos} did not open");
     };
@@ -201,6 +233,8 @@ async fn smelt(bot: &Client, input: &Items, output: &Items, n: i32) -> Result<()
     handle.shift_click(1usize);
     bot.wait_ticks(2).await;
     drop(handle);
+    bot.wait_ticks(2).await;
+    pick_up(bot, pos, &items!(Furnace)).await;
     if inv::count(bot, output) < before + n {
         bail!("furnace gave {} of {n}", inv::count(bot, output) - before);
     }
@@ -223,7 +257,7 @@ pub async fn hotbar_tools(bot: &Client) {
             continue;
         }
         if let Some(&(from, _, _)) = inv::slots_of(bot, &Items::one(*best)).first()
-            && let Ok(Some(h)) = bot.open_inventory()
+            && let Some(h) = crate::craft::open_own_inventory(bot).await
         {
             h.click(azalea::inventory::operations::SwapClick { source_slot: from as u16, target_slot: hotbar as u8 });
             bot.wait_ticks(2).await;
