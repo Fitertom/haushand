@@ -1,6 +1,6 @@
 //! A bot that plays Minecraft from a fresh spawn to the dragon's death.
 //!
-//! `speedrun_bot [--server host:port] [--name Bot] [--owner Player] [--go]`. In chat the
+//! `speedrun_bot [--server host:port] [--name Bot] [--owner Player] [--go] [--exit]`. In chat the
 //! owner says `!go` (the whole run), `!stage <name>` (one stage, for testing), `!stop`,
 //! `!inv`, `!pos`.
 
@@ -29,12 +29,14 @@ struct Args {
     name: String,
     owner: Option<String>,
     autostart: bool,
+    /// Quit when the autostarted run ends, so a test does not idle until its timeout.
+    exit: bool,
     /// Run only this stage on spawn (testing without chat).
     stage: Option<String>,
 }
 
 fn args() -> Args {
-    let mut a = Args { server: "localhost".into(), name: "SpeedBot".into(), owner: None, autostart: false, stage: None };
+    let mut a = Args { server: "localhost".into(), name: "SpeedBot".into(), owner: None, autostart: false, exit: false, stage: None };
     let mut it = std::env::args().skip(1);
     while let Some(k) = it.next() {
         match k.as_str() {
@@ -42,6 +44,7 @@ fn args() -> Args {
             "--name" => a.name = it.next().expect("--name needs a value"),
             "--owner" => a.owner = it.next(),
             "--go" => a.autostart = true,
+            "--exit" => a.exit = true,
             "--stage" => {
                 a.autostart = true;
                 a.stage = it.next();
@@ -137,12 +140,19 @@ fn start(bot: &Client, state: &State, stage: Option<String>) {
             Some(s) => run::stage(&bot, s).await,
             None => run::all(&bot).await,
         };
+        let ok = result.is_ok();
         match result {
             Ok(()) => bot.chat(format!("done: {}", stage.as_deref().unwrap_or("run"))),
             Err(e) => {
                 error!("{e:?}");
                 bot.chat(format!("failed: {e}"));
             }
+        }
+        if ARGS.get().is_some_and(|a| a.exit) {
+            info!("run over (ok={ok}), exiting");
+            // the chat line and the log's last records need a moment to go out
+            bot.wait_ticks(10).await;
+            std::process::exit(if ok { 0 } else { 1 });
         }
     }));
 }
