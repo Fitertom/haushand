@@ -6,6 +6,7 @@
 
 mod click;
 mod craft;
+mod dig;
 mod inv;
 mod mine;
 mod obtain;
