@@ -501,8 +501,8 @@ pub async fn fetch_drops(bot: &Client, died_at: Option<Vec3>) {
     let here = world::me(bot);
     let lava_there = (-1..=1).any(|dy| world::kind_at(bot, BlockPos::from(at).up(dy)) == BlockKind::Lava);
     info!("respawned at {here:.0}, died at {at:.0} ({:.0} blocks){}", here.distance_to(at), if lava_there { ", in lava" } else { "" });
-    // items lie 5 minutes; walking more than ~150 blocks back is slower than starting over
-    if lava_there || here.distance_to(at) > 150.0 || at.y < -60.0 {
+    // items lie 5 minutes; walking more than ~100 blocks back (at night, through the mobs that killed us) is slower than starting over
+    if lava_there || here.distance_to(at) > 100.0 || at.y < -60.0 {
         return;
     }
     let goal = azalea::pathfinder::goals::RadiusGoal::new(at, 2.0);

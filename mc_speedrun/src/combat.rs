@@ -178,6 +178,10 @@ static LAST_HURT: AtomicU64 = AtomicU64::new(0);
 /// Watches the server's damage events for hits on us, to fight back against what hit us
 /// (a skeleton out of the usual range, a provoked neutral mob).
 pub fn packet(bot: &Client, packet: &ClientboundGamePacket) {
+    if let ClientboundGamePacket::ChangeDifficulty(d) = packet {
+        DIFFICULTY.store(d.difficulty as u8, Ordering::Relaxed);
+        return;
+    }
     let ClientboundGamePacket::DamageEvent(p) = packet else { return };
     let Some(me) = bot.component::<MinecraftEntityId>().ok().map(|i| *i) else { return };
     if p.entity_id != me {
@@ -191,6 +195,14 @@ pub fn packet(bot: &Client, packet: &ClientboundGamePacket) {
         hurt.retain(|(id, t)| *id != by.0 && now.saturating_sub(*t) < 600);
         hurt.push((by.0, now));
     }
+}
+
+/// The world's difficulty as the server last said (255: not yet).
+static DIFFICULTY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+
+/// Whether the server said the world is peaceful (no hostile mobs to arm against).
+pub fn peaceful() -> bool {
+    DIFFICULTY.load(Ordering::Relaxed) == 0
 }
 
 /// Whether `id` hurt us within the last `ticks`.
@@ -225,6 +237,11 @@ fn threat_score(bot: &Client, me: Vec3, m: &Mob) -> Option<f64> {
     let dy = (m.pos.y - me.y).abs();
     let d = m.pos.horizontal_distance_squared_to(me).sqrt();
     let hit_us = hurt_by(bot, m.id, 100);
+    // bare hands do 1 a punch: walk up to nothing, fight only what is on us (the rest is
+    // outrun by `defend`)
+    if !armed(bot) && m.role() != Role::Creeper && (d > 4.0 || dy > 2.5) {
+        return None;
+    }
     let engage = match m.role() {
         Role::Melee => d < 10.0 && dy < 5.0,
         Role::Ranged => d < 14.0 && dy < 6.0,
@@ -305,6 +322,11 @@ pub fn held(bot: &Client) -> ItemKind {
 fn charged(bot: &Client) -> bool {
     // one tick more than the charge: our tick count and the server's drift by a tick
     bot.ticks_connected().saturating_sub(CHARGE_START.load(Ordering::Relaxed)) > charge_ticks(held(bot))
+}
+
+/// Whether we carry a sword or an axe.
+pub fn armed(bot: &Client) -> bool {
+    WEAPONS.iter().any(|(k, _)| inv::count_kind(bot, *k) > 0)
 }
 
 /// Holds the best weapon we have (nothing changes if it is already in hand).
@@ -531,6 +553,10 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
     let role = first.role();
     info!("fight {:?} at {:.1} blocks (hp {:.0}, ours {:.0})", first.kind, first.pos.distance_to(crate::world::me(bot)), first.health, health(bot));
     hold_weapon(bot).await;
+    let avoid = role == Role::Creeper && (!WEAPONS.iter().any(|(k, _)| *k == held(bot)) || health(bot) < 10.0);
+    if avoid {
+        info!("keeping away from the creeper (weapon {:?}, hp {:.0})", held(bot), health(bot));
+    }
     let start = Instant::now();
     let mut last_pos = first.pos;
     let mut last_kind = first.kind;
@@ -577,13 +603,25 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
             give_up(bot, target, 1200);
             break Outcome::GaveUp;
         }
+        // losing: a few hearts left and it is far from dead. Out, to run and eat (`defend`)
+        if role != Role::Food && health(bot) < LOW_HP && m.health > 4.0 {
+            info!("fight: leaving {:?} (hp {:.0}) with our hp {:.0}", m.kind, m.health, health(bot));
+            give_up(bot, target, 100);
+            break Outcome::GaveUp;
+        }
         // a creeper about to blow: run until it stops (it swells only within 7 blocks)
-        if role == Role::Creeper && m.swelling && (flat_d < 7.5 || fleeing) {
-            if !fleeing {
+        // without a weapon (20 punches) or hurt, a creeper is not fought: kept away from
+        if role == Role::Creeper && avoid && flat_d > 10.0 {
+            info!("creeper left behind at {flat_d:.1}");
+            give_up(bot, target, 300);
+            break Outcome::Gone;
+        }
+        if role == Role::Creeper && ((m.swelling && (flat_d < 7.5 || fleeing)) || avoid) {
+            if !fleeing && !avoid {
                 info!("creeper swelling at {flat_d:.1}, running");
-                if pathing_to.take().is_some() {
-                    crate::world::stop_path(bot).await;
-                }
+            }
+            if pathing_to.take().is_some() {
+                crate::world::stop_path(bot).await;
             }
             fleeing = true;
             let away = me - toward * 4.0;
@@ -700,11 +738,88 @@ pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outc
     Ok(outcome)
 }
 
+/// Health below which a fight is left for running and eating.
+const LOW_HP: f32 = 7.0;
+
+/// Runs from `threats` for `ticks`: sprinting (walking when too hungry to sprint) away from
+/// where they stand, turning aside from a drop or lava, jumping up steps.
+pub async fn flee(bot: &Client, threats: &[Mob], ticks: u32) {
+    if threats.is_empty() {
+        return;
+    }
+    crate::world::stop_path(bot).await;
+    info!("running from {:?} (hp {:.0})", threats.iter().map(|m| m.kind).collect::<Vec<_>>(), health(bot));
+    let can_sprint = crate::survival::food_level(bot) > 6;
+    for _ in 0..ticks {
+        if !alive(bot) {
+            break;
+        }
+        let me = crate::world::me(bot);
+        // away from each, the nearer the more
+        let mut away = Vec3::ZERO;
+        for m in threats {
+            if let Some(now) = mob(bot, m.entity) {
+                let d = Vec3::new(me.x - now.pos.x, 0.0, me.z - now.pos.z);
+                let len = d.length().max(0.5);
+                away = away + d * (1.0 / (len * len));
+            }
+        }
+        let len = away.length();
+        if len < 1e-6 {
+            break;
+        }
+        let dir = away * (1.0 / len);
+        // the first safe heading of: straight away, then turning aside more and more
+        let heading = [0.0f64, 40.0, -40.0, 80.0, -80.0, 120.0, -120.0]
+            .iter()
+            .map(|a| {
+                let (s, c) = a.to_radians().sin_cos();
+                Vec3::new(dir.x * c - dir.z * s, 0.0, dir.x * s + dir.z * c)
+            })
+            .find(|h| safe_step(bot, *h));
+        let Some(h) = heading else {
+            bot.walk(WalkDirection::None);
+            bot.wait_ticks(1).await;
+            continue;
+        };
+        face(bot, me + h * 4.0);
+        if can_sprint {
+            bot.sprint(azalea::SprintDirection::Forward);
+        } else {
+            bot.walk(WalkDirection::Forward);
+        }
+        let (_, on_ground, blocked, in_water) = physics(bot);
+        bot.set_jumping(in_water || (blocked && on_ground)).ok();
+        bot.wait_ticks(1).await;
+    }
+    bot.walk(WalkDirection::None);
+    bot.set_jumping(false).ok();
+}
+
 /// Fights whatever threatens us until nothing does (a few at most). Returns how many
 /// fights there were.
 pub async fn defend(bot: &Client) -> Result<usize> {
     let mut n = 0;
+    let mut runs = 0;
     while n < 8 {
+        // hurt with hostiles about, or bare-handed with them closing in: run first, eat
+        // when out of their reach
+        let hostile = |m: &Mob| matches!(m.role(), Role::Melee | Role::Ranged | Role::Creeper);
+        let me = crate::world::me(bot);
+        let near: Vec<Mob> = mobs_near(bot, 16.0).into_iter().filter(|m| hostile(m) && (m.pos.y - me.y).abs() < 6.0).collect();
+        let low = health(bot) < LOW_HP && !near.is_empty();
+        let chased = !armed(bot) && near.iter().any(|m| m.box_distance(crate::click::eye(bot)) < 8.0 && m.role() != Role::Creeper);
+        if (low || chased) && runs < 3 {
+            runs += 1;
+            flee(bot, &near, 60).await;
+            if low {
+                crate::survival::eat_if_needed(bot).await?;
+            }
+            if !alive(bot) {
+                break;
+            }
+            continue;
+        }
         let Some(t) = pick_target(bot) else { break };
         // hurt and with a moment before it arrives: eat first, the fight goes better with
         // the health coming back

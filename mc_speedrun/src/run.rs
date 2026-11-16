@@ -36,6 +36,10 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
         "wood" => {
             obtain(bot, craft::logs(), 6).await?;
             obtain(bot, Items::one(ItemKind::WoodenPickaxe), 1).await?;
+            // bare hands lose to a zombie at night; two planks and a stick do not
+            if !crate::combat::peaceful() && !crate::combat::armed(bot) {
+                obtain(bot, Items::one(ItemKind::WoodenSword), 1).await?;
+            }
         }
         "stone" => {
             obtain(bot, Items::one(ItemKind::StonePickaxe), 1).await?;
