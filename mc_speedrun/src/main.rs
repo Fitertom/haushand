@@ -8,6 +8,7 @@ mod click;
 mod craft;
 mod dig;
 mod inv;
+mod nether;
 mod obtain;
 mod place;
 mod portal;
@@ -146,8 +147,18 @@ fn start(bot: &Client, state: &State, stage: Option<String>) {
         if delay > 0 {
             bot.wait_ticks(delay).await;
         }
+        // `--stage a,b` runs those stages in order (a test of several at once)
         let result = match &stage {
-            Some(s) => run::stage(&bot, s).await,
+            Some(list) => {
+                let mut r = Ok(());
+                for s in list.split(',') {
+                    r = run::stage(&bot, s).await;
+                    if r.is_err() {
+                        break;
+                    }
+                }
+                r
+            }
             None => run::all(&bot).await,
         };
         let ok = result.is_ok();

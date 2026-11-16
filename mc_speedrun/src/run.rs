@@ -69,6 +69,19 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
             crate::portal::light(bot, &site).await?;
             crate::portal::enter(bot, &site).await?;
         }
+        // What is loaded around the bot (fortress bricks, spawners, gold, forests, lava).
+        "survey" => {
+            bot.wait_ticks(100).await;
+            crate::nether::survey(bot);
+        }
+        "fortress" => {
+            let p = crate::nether::find_fortress(bot).await?;
+            info!("fortress: {p}, {:.0} away", p.center().distance_to(crate::world::me(bot)));
+            crate::nether::walk_to(bot, p, 24.0, 40.0).await?;
+            let s = crate::nether::find_spawner(bot, p).await?;
+            crate::nether::walk_to(bot, s, 6.0, 40.0).await?;
+            info!("at the spawner {s}: {:?}", crate::world::me(bot));
+        }
         // What the bot thinks stands in a column under it and around: to check chunk decoding
         // against the server's view.
         // A short walk, our position logged each half second, to compare with the server's.

@@ -273,3 +273,21 @@ pub async fn settle(bot: &Client) {
 pub async fn goto_block(bot: &Client, pos: BlockPos) -> Result<()> {
     goto_timeout(bot, BlockPosGoal(pos), Duration::from_secs(120)).await
 }
+
+/// Within `r` blocks of (`x`, `z`) across, at any height: for a leg of a long walk, where
+/// the ground's height at the end is not known and an exact column may be lava or wall.
+#[derive(Clone, Copy, Debug)]
+pub struct NearXZ {
+    pub x: f64,
+    pub z: f64,
+    pub r: f64,
+}
+impl azalea::pathfinder::goals::Goal for NearXZ {
+    fn heuristic(&self, n: BlockPos) -> f32 {
+        let d = ((n.x as f64 + 0.5 - self.x).powi(2) + (n.z as f64 + 0.5 - self.z).powi(2)).sqrt();
+        ((d - self.r).max(0.0) as f32) * azalea::pathfinder::costs::COST_HEURISTIC
+    }
+    fn success(&self, n: BlockPos) -> bool {
+        (n.x as f64 + 0.5 - self.x).powi(2) + (n.z as f64 + 0.5 - self.z).powi(2) <= self.r * self.r
+    }
+}
