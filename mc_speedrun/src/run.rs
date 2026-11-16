@@ -57,6 +57,33 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
             obtain(bot, Items::one(ItemKind::IronSword), 1).await?;
             hotbar_tools(bot).await;
         }
+        // Down a staircase to diamond level, carrying what is needed there: a second bucket
+        // (water to cast obsidian with, one to carry lava), sticks for the diamond pickaxe,
+        // stone to seal lava and floor gaps, and water from the surface if there is some.
+        "descend" => {
+            obtain(bot, items!(Bucket, WaterBucket, LavaBucket), 2).await?;
+            obtain(bot, Items::one(ItemKind::Stick), 2).await?;
+            obtain(bot, items!(CraftingTable), 1).await?;
+            obtain(bot, craft::stone_material(), 16).await?;
+            if let Err(e) = crate::mine::water_bucket(bot, 64.0).await {
+                info!("no water bucket on the way down: {e}");
+            }
+            hotbar_tools(bot).await;
+            if crate::world::feet(bot).y > crate::mine::DIAMOND_Y + 1 {
+                crate::mine::descend(bot, crate::mine::DIAMOND_Y).await?;
+            }
+        }
+        "diamonds" => {
+            crate::mine::diamonds(bot, 3).await?;
+        }
+        // 10 obsidian, the corners of a portal frame left out.
+        "obsidian" => {
+            if inv::count_kind(bot, ItemKind::Obsidian) < 10 {
+                obtain(bot, Items::one(ItemKind::DiamondPickaxe), 1).await?;
+                hotbar_tools(bot).await;
+                crate::mine::obsidian(bot, 10).await?;
+            }
+        }
         // What the bot thinks stands in a column under it and around: to check chunk decoding
         // against the server's view.
         // A short walk, our position logged each half second, to compare with the server's.

@@ -31,7 +31,7 @@ use crate::{
     craft::{self, items},
     inv::{self, Items},
     place,
-    world::{block_at, drops_near, feet, me, world_lock},
+    world::{block_at, drops_near, feet, me, stop_path, world_lock},
 };
 
 /// Feet level of the strip mine. Diamonds get more common down to -64, but below -54
@@ -149,17 +149,30 @@ pub async fn walk_to(bot: &Client, pos: BlockPos) -> Result<()> {
     Ok(())
 }
 
-/// The pathfinder with our underground moves, optionally digging, with a deadline.
+/// The pathfinder with our underground moves, optionally digging, with a deadline; gives
+/// up as well after 100 game ticks without moving (a goal it cannot reach).
 async fn goto_opts(bot: &Client, goal: impl Goal + 'static, mining: bool, limit: Duration) -> Result<()> {
     let opts = PathfinderOpts::new().allow_mining(mining).successors_fn(moves::underground_move);
-    match tokio::time::timeout(limit, bot.goto_with_opts(goal, opts)).await {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            bot.force_stop_pathfinding();
-            bot.walk(azalea::WalkDirection::None);
-            bail!("path timed out")
+    let stuck = async {
+        let mut last = me(bot);
+        loop {
+            bot.wait_ticks(100).await;
+            let now = me(bot);
+            if now.distance_to(last) < 0.5 {
+                return;
+            }
+            last = now;
         }
+    };
+    let r = tokio::select! {
+        r = tokio::time::timeout(limit, bot.goto_with_opts(goal, opts)) => r.map_err(|_| eyre!("path timed out")),
+        () = stuck => Err(eyre!("path stuck: no move in 100 ticks")),
+    };
+    if r.is_err() {
+        stop_path(bot).await;
+        bot.walk(azalea::WalkDirection::None);
     }
+    r
 }
 
 /// Breaks the block at `pos` (in reach and in view) with the best tool. Refuses when a
@@ -374,9 +387,54 @@ fn facing(bot: &Client) -> Dir {
     [BlockPos::new(0, 0, 1), BlockPos::new(-1, 0, 0), BlockPos::new(0, 0, -1), BlockPos::new(1, 0, 0)][q as usize]
 }
 
+/// A spot to start a staircase from with no water or lava near: started on a beach or a
+/// river bank, every direction ran into water within a step.
+fn dry_spot(bot: &Client, radius: i32) -> Option<BlockPos> {
+    let f = feet(bot);
+    let w = world_lock(bot);
+    let w = w.read();
+    let get = |p: BlockPos| w.get_block_state(p).unwrap_or_default();
+    let wet = |p: BlockPos| {
+        for dx in -4..=4 {
+            for dz in -4..=4 {
+                for dy in -5..=1 {
+                    if fluid(get(BlockPos::new(p.x + dx, p.y + dy, p.z + dz))) != FluidKind::Empty {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    };
+    let mut best: Option<(i32, BlockPos)> = None;
+    for dx in -radius..=radius {
+        for dz in -radius..=radius {
+            for dy in -3..=3 {
+                let p = BlockPos::new(f.x + dx, f.y + dy, f.z + dz);
+                let d = dx * dx + dz * dz + dy * dy;
+                if best.is_some_and(|(bd, _)| bd <= d) {
+                    continue;
+                }
+                if solid(get(p + DOWN)) && open(get(p)) && open(get(p + UP)) && !wet(p) {
+                    best = Some((d, p));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// Digs a staircase down until our feet are at `target_y`.
 pub async fn descend(bot: &Client, target_y: i32) -> Result<()> {
     crate::obtain::hotbar_tools(bot).await;
+    if let Some(p) = dry_spot(bot, 2).filter(|&p| p == feet(bot)).or_else(|| dry_spot(bot, 24)) {
+        if p != feet(bot) {
+            info!("starting the staircase away from water, at {p}");
+            if let Err(e) = goto_opts(bot, BlockPosGoal(p), false, Duration::from_secs(40)).await {
+                info!("could not walk to {p}: {e}");
+            }
+        }
+    }
     let mut d = facing(bot);
     let mut fails = 0;
     let start = feet(bot);
@@ -519,7 +577,7 @@ async fn collect(bot: &Client, around: Vec3) {
 }
 
 /// Mines every seen ore of interest near us. Returns how many it got.
-async fn mine_seen(bot: &Client, failed: &mut Vec<BlockPos>, done: &dyn Fn(&Client) -> bool) -> usize {
+async fn mine_seen(bot: &Client, failed: &mut Vec<BlockPos>, done: &(dyn Fn(&Client) -> bool + Sync)) -> usize {
     let mut n = 0;
     while !done(bot) {
         let Some(&(pos, _)) = seen_ores(bot, failed).first() else { break };
@@ -549,7 +607,7 @@ async fn back_to_level(bot: &Client, y: i32) -> Result<()> {
 
 /// Strip mines at `y` until `done`: a straight 1×2 tunnel, turning where liquid or
 /// bedrock is ahead, mining every seen ore of interest on the way.
-async fn strip_mine(bot: &Client, y: i32, done: &dyn Fn(&Client) -> bool, max_steps: usize) -> Result<()> {
+async fn strip_mine(bot: &Client, y: i32, done: &(dyn Fn(&Client) -> bool + Sync), max_steps: usize) -> Result<()> {
     crate::obtain::hotbar_tools(bot).await;
     let mut failed = Vec::new();
     let mut d = facing(bot);
