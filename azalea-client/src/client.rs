@@ -170,17 +170,21 @@ async fn run_schedule_loop(
     // azalea runs the Update schedule at most 60 times per second to simulate
     // framerate. unlike vanilla though, we also only handle packets during
     // Updates due to everything running in ecs systems.
-    const UPDATE_DURATION_TARGET: Duration = Duration::from_micros(1_000_000 / 60);
-    // minecraft runs at 20 tps
-    const GAME_TICK_DURATION_TARGET: Duration = Duration::from_micros(1_000_000 / 20);
+    const UPDATE_DURATION_TARGET_MAX: Duration = Duration::from_micros(1_000_000 / 60);
 
     loop {
+        // minecraft runs at 20 tps unless the server says otherwise (`/tick rate`)
+        let game_tick_duration_target =
+            Duration::from_secs_f64(1.0 / azalea_core::tick::tick_rate() as f64);
+        // an update at least as often as a tick, or a sped-up server outruns us
+        let update_duration_target = UPDATE_DURATION_TARGET_MAX.min(game_tick_duration_target);
+
         // sleep until the next update if necessary
         let now = Instant::now();
         if let Some(last_update) = last_update {
             let elapsed = now.duration_since(last_update);
-            if elapsed < UPDATE_DURATION_TARGET {
-                time::sleep(UPDATE_DURATION_TARGET - elapsed).await;
+            if elapsed < update_duration_target {
+                time::sleep(update_duration_target - elapsed).await;
             }
         }
         last_update = Some(now);
@@ -190,16 +194,16 @@ async fn run_schedule_loop(
         // if last tick is None or more than 50ms ago, run the GameTick schedule
         ecs.run_schedule(outer_schedule_label);
         if last_tick
-            .map(|last_tick| last_tick.elapsed() > GAME_TICK_DURATION_TARGET)
+            .map(|last_tick| last_tick.elapsed() > game_tick_duration_target)
             .unwrap_or(true)
         {
             if let Some(last_tick) = &mut last_tick {
-                *last_tick += GAME_TICK_DURATION_TARGET;
+                *last_tick += game_tick_duration_target;
 
                 // if we're more than 10 ticks behind, set last_tick to now.
                 // vanilla doesn't do it in exactly the same way but it
                 // shouldn't really matter
-                if (now - *last_tick) > GAME_TICK_DURATION_TARGET * 10 {
+                if (now - *last_tick) > game_tick_duration_target * 10 {
                     warn!(
                         "GameTick is more than 10 ticks behind, skipping ticks so we don't have to burst too much"
                     );

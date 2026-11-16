@@ -7,9 +7,26 @@ use std::{
 use azalea_buf::{AzBuf, BufReadError};
 
 /// Represents Java's BitSet, a list of bits.
-#[derive(AzBuf, Clone, Debug, Default, Eq, Hash, PartialEq)]
+///
+/// On the wire since 26.3 it is Java's `toByteArray`: a length-prefixed byte array,
+/// little-endian, trailing zero bytes dropped (before, an array of longs).
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
 pub struct BitSet {
     data: Box<[u64]>,
+}
+
+impl AzBuf for BitSet {
+    fn azalea_read(buf: &mut Cursor<&[u8]>) -> Result<Self, BufReadError> {
+        let bytes = Vec::<u8>::azalea_read(buf)?;
+        Ok(BitSet::from(bytes))
+    }
+    fn azalea_write(&self, buf: &mut impl Write) -> io::Result<()> {
+        let mut bytes: Vec<u8> = self.data.iter().flat_map(|w| w.to_le_bytes()).collect();
+        while bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        bytes.azalea_write(buf)
+    }
 }
 
 /// `log2(64)`.

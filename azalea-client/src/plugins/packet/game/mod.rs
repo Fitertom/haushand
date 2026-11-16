@@ -17,7 +17,6 @@ use azalea_entity::{
     metadata::{Health, apply_metadata},
 };
 use azalea_protocol::{
-    common::movements::MoveFlags,
     packets::{
         ConnectionProtocol,
         game::{c_move_entity_pos_rot::CompactLookDirection, *},
@@ -436,6 +435,7 @@ impl GamePacketHandler<'_> {
             // old_pos is set to the current position when we're teleported
             physics.set_old_pos(*position);
 
+            debug!("accepting teleport {} at {:?} {:?}", p.id, **position, *direction);
             // send the relevant packets
             commands.trigger(SendGamePacketEvent::new(
                 self.player,
@@ -447,14 +447,8 @@ impl GamePacketHandler<'_> {
                     x_rot: direction.x_rot(),
                 },
             ));
-            commands.trigger(SendGamePacketEvent::new(
-                self.player,
-                ServerboundMovePlayerPosRot {
-                    pos: **position,
-                    look_direction: *direction,
-                    flags: MoveFlags::default(),
-                },
-            ));
+            // No move packet after it: since 26.3 the accept carries the position, and a
+            // second position in the same tick gets the player kicked for invalid movement.
         });
     }
 
@@ -1592,7 +1586,10 @@ impl GamePacketHandler<'_> {
     pub fn bundle_delimiter(&mut self, _p: &ClientboundBundleDelimiter) {}
     pub fn damage_event(&mut self, _p: &ClientboundDamageEvent) {}
     pub fn hurt_animation(&mut self, _p: &ClientboundHurtAnimation) {}
-    pub fn ticking_state(&mut self, _p: &ClientboundTickingState) {}
+    pub fn ticking_state(&mut self, p: &ClientboundTickingState) {
+        debug!("server tick rate {} (frozen: {})", p.tick_rate, p.is_frozen);
+        azalea_core::tick::set_tick_rate(p.tick_rate);
+    }
     pub fn ticking_step(&mut self, _p: &ClientboundTickingStep) {}
     pub fn reset_score(&mut self, _p: &ClientboundResetScore) {}
     pub fn cookie_request(&mut self, p: &ClientboundCookieRequest) {

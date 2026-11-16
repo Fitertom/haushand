@@ -14,10 +14,14 @@ pub struct ServerboundPlayerAction {
 #[derive(AzBuf, Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
     StartDestroyBlock = 0,
-    AbortDestroyBlock = 1,
-    StopDestroyBlock = 2,
-    DropAllItems = 3,
-    DropItem = 4,
-    ReleaseUseItem = 5,
-    SwapItemWithOffhand = 6,
+    /// New in 26.3, and put second: every action after it moved up by one, and a client
+    /// sending the old numbers aborted each block it meant to finish.
+    ChangeDestroyDirection = 1,
+    AbortDestroyBlock = 2,
+    StopDestroyBlock = 3,
+    DropAllItems = 4,
+    DropItem = 5,
+    ReleaseUseItem = 6,
+    SwapItemWithOffhand = 7,
+    Stab = 8,
 }
