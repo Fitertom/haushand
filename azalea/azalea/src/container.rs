@@ -337,7 +337,12 @@ pub fn handle_menu_opened_event(
     mut events: MessageReader<ReceiveGamePacketEvent>,
 ) {
     for event in events.read() {
-        if let ClientboundGamePacket::ContainerSetContent { .. } = event.packet.as_ref() {
+        // Only a container's own contents mean it opened: the server also resends the
+        // player's inventory (id 0) after a craft, and taking that as the open made
+        // `open_container_at` return None at once when it came just after a click.
+        if let ClientboundGamePacket::ContainerSetContent(p) = event.packet.as_ref()
+            && p.container_id != 0
+        {
             commands
                 .entity(event.entity)
                 .remove::<WaitingForInventoryOpen>();

@@ -14,7 +14,7 @@ Everything here ran in a Linux cloud container (4 cores, 15 GB RAM).
   "You are not white-listed"), `enable-rcon=true`, `rcon.password=testpass`,
   `rcon.port=25575`, `difficulty=peaceful` for mechanics tests.
 - Start detached (a tool's background job dies after its time limit):
-  `cd /home/user/mcserver/run && setsid nohup java -Xmx3G -jar server.jar nogui > server.log 2>&1 < /dev/null &`
+  `cd /home/user/mcserver/run && setsid nohup java -Dmcrun=/home/user/mcserver/run -Xmx3G -jar server.jar nogui > server.log 2>&1 < /dev/null &`
 - After start, via RCON (`dev/rcon.py "<cmd>" ...`):
   `tick rate 60` (×3 speed; the bot follows), `difficulty peaceful`, `time set day`,
   `gamerule advance_time false` (26.3 name; `doDaylightCycle` no longer exists).
