@@ -5,3 +5,8 @@
 !/styles.css
 !/.gitignore
 !/.nojekyll
+
+# Speedrun bot handoff stored alongside the site (this branch only)
+!/HANDOFF.md
+!/mc_speedrun/
+!/azalea/
