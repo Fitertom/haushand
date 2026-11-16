@@ -536,6 +536,7 @@ pub fn strike(bot: &Client, target: Entity) -> bool {
         debug!("not hitting {:?}: not in the crosshair (box {:.2} away)", m.kind, m.box_distance(eye));
         return false;
     };
+    info!("strike {:?} with {:?} (mob hp {:.1}, hp {:.0})", m.kind, held(bot), m.health, health(bot));
     bot.write_packet(ServerboundAttack { entity_id: m.id });
     bot.write_packet(ServerboundPunch);
     CHARGE_START.store(bot.ticks_connected(), Ordering::Relaxed);
