@@ -60,6 +60,10 @@ pub fn find_blocks(bot: &Client, states: &BlockStates, max: usize, avoid: &[Bloc
 
 /// Walks until `pos` is within reach. Fails when the pathfinder gave up.
 pub async fn reach(bot: &Client, pos: BlockPos) -> Result<()> {
+    // seen from here, in reach: nothing to walk
+    if crate::click::sight(bot, pos).is_some() {
+        return Ok(());
+    }
     let chunks = world_lock(bot).read().chunks.clone();
     let goal = ReachBlockPosGoal::new(pos, chunks);
     let from = me(bot);
@@ -104,11 +108,13 @@ pub async fn mine_at(bot: &Client, pos: BlockPos) -> Result<()> {
         collect_drops(bot, pos.center(), 6.0).await;
         return Ok(());
     }
-    bot.look_at(pos.center());
-    bot.wait_ticks(1).await;
-    match tokio::time::timeout(Duration::from_secs(40), bot.mine_with_auto_tool(pos)).await {
-        Ok(r) => r?,
-        Err(_) => bail!("mining {pos} took too long"),
+    if let Err(e) = crate::dig::dig(bot, pos).await {
+        // the reach goal can end where the block is in reach but hidden: a step closer
+        if crate::click::sight(bot, pos).is_some() {
+            return Err(e);
+        }
+        let _ = goto_timeout(bot, RadiusGoal::new(pos.center(), 2.0), Duration::from_secs(10)).await;
+        crate::dig::dig(bot, pos).await?;
     }
     bot.wait_ticks(2).await;
     collect_drops(bot, pos.center(), 6.0).await;
@@ -166,8 +172,16 @@ pub fn height_above_ground(bot: &Client, pos: BlockPos) -> i32 {
 pub async fn find_or_explore(bot: &Client, states: &BlockStates, avoid: &[BlockPos]) -> Result<BlockPos> {
     let start = feet(bot);
     // what stands out of reach from the ground is skipped, as if it were not there
+    // Of those, the ones with a face open to the air first (mined without digging to
+    // them), and never the column under our feet while another will do: digging down
+    // where we stand dropped us into a pit with no room to put a table.
     let reachable = |bot: &Client| -> Option<BlockPos> {
-        find_blocks(bot, states, 16, avoid).into_iter().find(|&p| height_above_ground(bot, p) <= 3)
+        let f = feet(bot);
+        let found: Vec<BlockPos> = find_blocks(bot, states, 32, avoid).into_iter().filter(|&p| height_above_ground(bot, p) <= 3).collect();
+        let under = |p: &BlockPos| p.x == f.x && p.z == f.z && p.y < f.y;
+        let open = |p: &BlockPos| [p.up(1), p.down(1), p.north(1), p.south(1), p.east(1), p.west(1)].iter().any(|n| block_at(bot, *n).is_air());
+        let near = |p: &BlockPos| p.center().distance_to(me(bot)) < 12.0;
+        found.iter().find(|p| !under(p) && open(p) && near(p)).or_else(|| found.iter().find(|p| !under(p))).or(found.first()).copied()
     };
     // eight legs of a widening spiral, then give up: 8 × 64 blocks is far past any biome
     let dirs = [(1, 0), (0, 1), (-1, 0), (0, -1)];

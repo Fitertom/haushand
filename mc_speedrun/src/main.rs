@@ -7,6 +7,7 @@
 mod click;
 mod combat;
 mod craft;
+mod dig;
 mod inv;
 mod obtain;
 mod place;
