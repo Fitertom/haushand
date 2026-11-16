@@ -27,6 +27,8 @@ struct State {
     /// What the last `start` ran (a stage, or None for the whole run): it is started again
     /// after a death.
     last: Arc<Mutex<Option<Option<String>>>>,
+    /// A `tend` run while no run is going.
+    idle: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 struct Args {
@@ -93,7 +95,10 @@ async fn main() -> AppExit {
 async fn handle(bot: Client, event: Event, state: State) -> eyre::Result<()> {
     let a = ARGS.get().unwrap();
     match event {
-        Event::Tick => telemetry::sample(&bot),
+        Event::Tick => {
+            telemetry::sample(&bot);
+            guard_idle(&bot, &state);
+        }
         Event::Packet(p) => {
             telemetry::packet(&bot, &p);
             combat::packet(&bot, &p);
@@ -143,32 +148,52 @@ fn start(bot: &Client, state: &State, stage: Option<String>) {
         return;
     }
     *state.last.lock() = Some(stage.clone());
+    if let Some(t) = state.idle.lock().take() {
+        t.abort();
+    }
     let bot = bot.clone();
-    *task = Some(tokio::spawn(async move {
-        let result = match &stage {
-            Some(s) => run::stage(&bot, s).await,
-            None => run::all(&bot).await,
-        };
-        let ok = result.is_ok();
-        match result {
-            Ok(()) => bot.chat(format!("done: {}", stage.as_deref().unwrap_or("run"))),
-            Err(e) => {
-                error!("{e:?}");
-                bot.chat(format!("failed: {e}"));
-            }
+    *task = Some(tokio::spawn(run_task(bot, stage)));
+}
+
+async fn run_task(bot: Client, stage: Option<String>) {
+    let result = match &stage {
+        Some(s) => run::stage(&bot, s).await,
+        None => run::all(&bot).await,
+    };
+    let ok = result.is_ok();
+    match result {
+        Ok(()) => bot.chat(format!("done: {}", stage.as_deref().unwrap_or("run"))),
+        Err(e) => {
+            error!("{e:?}");
+            bot.chat(format!("failed: {e}"));
         }
-        if ARGS.get().is_some_and(|a| a.exit) {
-            info!("run over (ok={ok}), exiting");
-            // the chat line and the log's last records need a moment to go out
-            bot.wait_ticks(10).await;
-            std::process::exit(if ok { 0 } else { 1 });
-        }
+    }
+    if ARGS.get().is_some_and(|a| a.exit) {
+        info!("run over (ok={ok}), exiting");
+        // the chat line and the log's last records need a moment to go out
+        bot.wait_ticks(10).await;
+        std::process::exit(if ok { 0 } else { 1 });
+    }
+}
+
+/// With no run going the bot would stand still while a zombie eats it: tend once a second.
+fn guard_idle(bot: &Client, state: &State) {
+    if bot.ticks_connected() % 20 != 0 || state.task.lock().as_ref().is_some_and(|t| !t.is_finished()) {
+        return;
+    }
+    let mut idle = state.idle.lock();
+    if idle.as_ref().is_some_and(|t| !t.is_finished()) || !survival::urgent(bot) {
+        return;
+    }
+    let bot = bot.clone();
+    *idle = Some(tokio::spawn(async move {
+        let _ = survival::tend(&bot).await;
     }));
 }
 
 /// The run's task works on a world that is gone (inventory dropped, far from spawn): stop
-/// it, wait for the respawn, fetch what we dropped if it is near, and start the same run
-/// again. Stages are goals on the inventory, so it goes on from what is left.
+/// it, wait for the respawn, fetch what we dropped if it is near, and run the same again.
+/// Stages are goals on the inventory, so it goes on from what is left.
 fn on_death(bot: &Client, state: &State) {
     static HANDLING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     // azalea sends Death for the kill packet and for health reaching 0: handle one
@@ -178,19 +203,26 @@ fn on_death(bot: &Client, state: &State) {
     let pos = bot.position().ok();
     telemetry::record(bot, "death", serde_json::json!({"x": pos.map(|p| p.x), "y": pos.map(|p| p.y), "z": pos.map(|p| p.z)}));
     error!("died at {pos:?}");
-    if let Some(t) = state.task.lock().take() {
+    if let Some(t) = state.idle.lock().take() {
+        t.abort();
+    }
+    let mut task = state.task.lock();
+    let was_running = task.as_ref().is_some_and(|t| !t.is_finished());
+    if let Some(t) = task.take() {
         t.abort();
     }
     bot.force_stop_pathfinding();
     bot.walk(azalea::WalkDirection::None);
-    let (bot, state) = (bot.clone(), state.clone());
-    tokio::spawn(async move {
+    let last = state.last.lock().clone().filter(|_| was_running);
+    let bot = bot.clone();
+    // the new task takes the run's place at once, so the respawn's Spawn event does not
+    // autostart a second run beside it
+    *task = Some(tokio::spawn(async move {
         survival::after_death(&bot, pos).await;
         HANDLING.store(false, std::sync::atomic::Ordering::SeqCst);
-        let last = state.last.lock().clone();
         if let Some(stage) = last {
             info!("resuming {} after death", stage.as_deref().unwrap_or("the run"));
-            start(&bot, &state, stage);
+            run_task(bot, stage).await;
         }
-    });
+    }));
 }

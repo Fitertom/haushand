@@ -160,6 +160,7 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
         }
         // `eat`: food given, the bar drained by a hunger effect, then eaten back up.
         "eat" => {
+            bot.chat("/time set day");
             bot.chat("/give @s cooked_beef 3");
             bot.chat("/give @s bread 3");
             bot.chat("/effect give @s hunger 60 200");
@@ -193,6 +194,7 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
         }
         // `lava`: lava put at our feet (fire resistance so a slow escape is not a death).
         "lava" => {
+            bot.chat("/time set day");
             bot.chat("/effect give @s fire_resistance 30");
             bot.wait_ticks(5).await;
             bot.chat("/setblock ~ ~ ~ lava");
@@ -203,6 +205,7 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
         }
         // `die`: killed once; after the respawn the stage runs again and ends.
         "die" => {
+            bot.chat("/time set day");
             static DIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !DIED.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 bot.chat("/give @s cobblestone 5");

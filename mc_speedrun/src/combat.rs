@@ -542,6 +542,11 @@ pub async fn defend(bot: &Client) -> Result<usize> {
     let mut n = 0;
     while n < 8 {
         let Some(t) = pick_target(bot) else { break };
+        // hurt and with a moment before it arrives: eat first, the fight goes better with
+        // the health coming back
+        if health(bot) < 10.0 && t.pos.distance_to(crate::world::me(bot)) > 6.0 {
+            crate::survival::eat_if_needed(bot).await?;
+        }
         let limit = if t.role() == Role::Creeper { 25 } else { 30 };
         let out = fight(bot, t.entity, Duration::from_secs(limit)).await?;
         n += 1;

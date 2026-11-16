@@ -127,6 +127,8 @@ pub async fn eat(bot: &Client, kind: ItemKind) -> Result<bool> {
         for _ in 0..60 {
             bot.wait_ticks(1).await;
             if inv::count_kind(bot, kind) < before.0 || food_level(bot) > before.1 {
+                // the food bar and the stack come in separate packets: let both land
+                bot.wait_ticks(2).await;
                 info!("ate {kind:?}: food {} -> {}, hp {hp:.0}", before.1, food_level(bot));
                 return Ok(true);
             }
@@ -166,10 +168,11 @@ pub async fn get_food_if_needed(bot: &Client) -> Result<bool> {
         return Ok(false);
     }
     let now = bot.ticks_connected();
-    if food > 6 && now.saturating_sub(LAST_HUNT.load(Ordering::Relaxed)) < 400 {
+    let last = LAST_HUNT.load(Ordering::Relaxed);
+    if food > 6 && last != 0 && now.saturating_sub(last) < 400 {
         return Ok(false);
     }
-    LAST_HUNT.store(now, Ordering::Relaxed);
+    LAST_HUNT.store(now.max(1), Ordering::Relaxed);
     let before = food_points(bot);
     for _ in 0..3 {
         match combat::hunt(bot, FOOD_ANIMALS, 32.0).await {
