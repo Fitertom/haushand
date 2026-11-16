@@ -73,15 +73,27 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
                 crate::mine::descend(bot, crate::mine::DIAMOND_Y).await?;
             }
         }
+        // 3 diamonds, made into a diamond pickaxe at once (sticks and table carried down).
         "diamonds" => {
-            crate::mine::diamonds(bot, 3).await?;
-        }
-        // 10 obsidian, the corners of a portal frame left out.
-        "obsidian" => {
-            if inv::count_kind(bot, ItemKind::Obsidian) < 10 {
+            if inv::count_kind(bot, ItemKind::DiamondPickaxe) == 0 {
+                crate::mine::diamonds(bot, 3).await?;
                 obtain(bot, Items::one(ItemKind::DiamondPickaxe), 1).await?;
                 hotbar_tools(bot).await;
+            }
+        }
+        // 10 obsidian, the corners of a portal frame left out, cast from lava with the two
+        // buckets; then room for the portal dug right there, at diamond level.
+        "obsidian" => {
+            if inv::count_kind(bot, ItemKind::Obsidian) < 10 {
+                if inv::count_kind(bot, ItemKind::DiamondPickaxe) == 0 {
+                    crate::mine::diamonds(bot, 3).await?;
+                    obtain(bot, Items::one(ItemKind::DiamondPickaxe), 1).await?;
+                }
+                hotbar_tools(bot).await;
                 crate::mine::obsidian(bot, 10).await?;
+            }
+            if crate::portal::dimension(bot) == "minecraft:overworld" && crate::world::feet(bot).y < 40 {
+                crate::mine::portal_room(bot).await?;
             }
         }
         // A portal from what the bot carries (10 obsidian, 4 corner blocks), lit, entered.
