@@ -220,6 +220,7 @@ pub fn recipes() -> Vec<Recipe> {
         r("stick", s(), 4, &["P", "P"], vec![('P', p())]),
         r("crafting_table", items!(CraftingTable), 1, &["PP", "PP"], vec![('P', p())]),
         r("wooden_pickaxe", items!(WoodenPickaxe), 1, &["PPP", " S ", " S "], vec![('P', p()), ('S', s())]),
+        r("wooden_sword", items!(WoodenSword), 1, &["P", "P", "S"], vec![('P', p()), ('S', s())]),
         r("wooden_axe", items!(WoodenAxe), 1, &["PP", "PS", " S"], vec![('P', p()), ('S', s())]),
         r("stone_pickaxe", items!(StonePickaxe), 1, &["CCC", " S ", " S "], vec![('C', c()), ('S', s())]),
         r("stone_axe", items!(StoneAxe), 1, &["CC", "CS", " S"], vec![('C', c()), ('S', s())]),

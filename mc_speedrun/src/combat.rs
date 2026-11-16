@@ -1,0 +1,905 @@
+//! Fighting: seeing mobs, choosing one, holding a weapon, aiming and hitting at full charge.
+//!
+//! Everything here is cooperative: it runs inside the run's task, between or instead of its
+//! walks (`survival::tend`, `goto_guarded`), so there is never a second task steering the
+//! bot. Entities are read with one ECS query under one lock, like `world::drops_near`:
+//! azalea's `nearest_entities_by` reads our position while holding the ECS lock and froze
+//! the client.
+
+use std::{
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
+};
+
+use azalea::{
+    Client, Vec3, WalkDirection,
+    core::entity_id::MinecraftEntityId,
+    ecs::{entity::Entity, query::Without},
+    entity::{Dead, EntityKindComponent, LocalEntity, LookDirection, Physics, Position, dimensions::EntityDimensions, metadata},
+    pathfinder::goals::{Goal, RadiusGoal},
+    prelude::*,
+    protocol::packets::game::{ClientboundGamePacket, ServerboundAttack, ServerboundPunch},
+    registry::builtin::{EntityKind, ItemKind},
+    world::WorldName,
+};
+use eyre::{Result, bail};
+use parking_lot::Mutex;
+use tracing::{debug, info};
+
+use crate::inv::{self, Items};
+
+/// How far the server lets a hit land, from our eyes to the target's box. Vanilla's reach
+/// is 3.0; a little less so a hit sent as the target steps away still lands.
+const REACH: f64 = 2.9;
+
+/// How a mob is to be met.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Role {
+    /// Walks up and hits: fight it when it comes near.
+    Melee,
+    /// Shoots from a distance: close in (strafing) and hit.
+    Ranged,
+    /// Explodes: hit and step back, run when it starts to swell.
+    Creeper,
+    /// Out of a sword's reach most of the time (phantom, ghast, blaze, vex): hit only when it
+    /// comes within reach.
+    Flying,
+    /// Too strong for us (warden, ravager, creaking): keep away, never fight.
+    Avoid,
+    /// Attacks only when provoked (enderman, zombified piglin, wolf, ...): fight only what hit
+    /// us, and an enderman that screams at us.
+    Neutral,
+    /// Drops meat.
+    Food,
+    Other,
+}
+
+pub fn role(kind: EntityKind) -> Role {
+    use EntityKind as E;
+    match kind {
+        E::Zombie | E::ZombieVillager | E::Husk | E::Drowned | E::Spider | E::CaveSpider | E::Silverfish
+        | E::Endermite | E::Vindicator | E::Zoglin | E::Hoglin | E::PiglinBrute | E::WitherSkeleton | E::Slime
+        | E::MagmaCube | E::Giant | E::ZombieNautilus | E::CamelHusk | E::SulfurCube => Role::Melee,
+        E::Skeleton | E::Stray | E::Bogged | E::Parched | E::Pillager | E::Witch | E::Evoker | E::Illusioner
+        | E::Breeze | E::Guardian | E::ElderGuardian | E::Shulker => Role::Ranged,
+        E::Creeper => Role::Creeper,
+        E::Phantom | E::Ghast | E::Blaze | E::Vex => Role::Flying,
+        E::Warden | E::Ravager | E::Creaking | E::Wither | E::EnderDragon => Role::Avoid,
+        E::Enderman | E::ZombifiedPiglin | E::Piglin | E::Wolf | E::Bee | E::PolarBear | E::IronGolem | E::Llama
+        | E::TraderLlama | E::Panda | E::Goat | E::Dolphin => Role::Neutral,
+        E::Cow | E::Pig | E::Sheep | E::Chicken | E::Rabbit | E::Mooshroom => Role::Food,
+        _ => Role::Other,
+    }
+}
+
+/// A living entity as seen this tick.
+#[derive(Clone, Debug)]
+pub struct Mob {
+    pub entity: Entity,
+    pub id: MinecraftEntityId,
+    pub kind: EntityKind,
+    pub pos: Vec3,
+    pub width: f64,
+    pub height: f64,
+    pub health: f32,
+    pub baby: bool,
+    /// An enderman screaming (angry at someone, usually us).
+    pub angry: bool,
+    /// A creeper counting down to its explosion.
+    pub swelling: bool,
+}
+
+impl Mob {
+    pub fn role(&self) -> Role {
+        role(self.kind)
+    }
+    pub fn center(&self) -> Vec3 {
+        self.pos.up(self.height / 2.0)
+    }
+    /// The point of its box nearest to `from`: what reach is measured to, and where to aim.
+    pub fn nearest_point(&self, from: Vec3) -> Vec3 {
+        let r = self.width / 2.0;
+        Vec3::new(
+            from.x.clamp(self.pos.x - r, self.pos.x + r),
+            from.y.clamp(self.pos.y, self.pos.y + self.height),
+            from.z.clamp(self.pos.z - r, self.pos.z + r),
+        )
+    }
+    pub fn box_distance(&self, from: Vec3) -> f64 {
+        self.nearest_point(from).distance_to(from)
+    }
+}
+
+type MobRow<'a> = (
+    Entity,
+    &'a MinecraftEntityId,
+    &'a EntityKindComponent,
+    &'a Position,
+    &'a EntityDimensions,
+    &'a WorldName,
+    Option<&'a metadata::Health>,
+    Option<&'a Dead>,
+    Option<&'a metadata::AbstractAgeableBaby>,
+    Option<&'a metadata::Creepy>,
+    Option<&'a metadata::SwellDir>,
+    Option<&'a metadata::IsIgnited>,
+);
+
+fn to_mob(row: MobRow) -> Option<Mob> {
+    let (entity, id, kind, pos, dims, _, health, dead, baby, creepy, swell, ignited) = row;
+    let health = health.map(|h| h.0)?; // no health: not living (items, arrows, boats)
+    if dead.is_some() || health <= 0.0 {
+        return None;
+    }
+    Some(Mob {
+        entity,
+        id: *id,
+        kind: **kind,
+        pos: **pos,
+        width: dims.width as f64,
+        height: dims.height as f64,
+        health,
+        baby: baby.is_some_and(|b| b.0),
+        angry: creepy.is_some_and(|c| c.0),
+        swelling: swell.is_some_and(|s| s.0 > 0) || ignited.is_some_and(|i| i.0),
+    })
+}
+
+/// Living mobs (and other players) within `radius` of us, nearest first.
+pub fn mobs_near(bot: &Client, radius: f64) -> Vec<Mob> {
+    // our own position and world first, the ECS lock after (lock order, see TESTING.md)
+    let me = crate::world::me(bot);
+    let world_name = bot.component::<WorldName>().ok().map(|w| w.clone());
+    let Some(world_name) = world_name else { return Vec::new() };
+    let mut ecs = bot.ecs.write();
+    let mut query = ecs.query_filtered::<MobRow, Without<LocalEntity>>();
+    let mut found: Vec<Mob> = query
+        .iter(&ecs)
+        .filter(|row| *row.5 == world_name && row.3.distance_squared_to(me) < radius * radius)
+        .filter_map(to_mob)
+        .collect();
+    found.sort_by(|a, b| a.pos.distance_squared_to(me).total_cmp(&b.pos.distance_squared_to(me)));
+    found
+}
+
+/// One entity as it is now; None once it died or went out of view.
+pub fn mob(bot: &Client, entity: Entity) -> Option<Mob> {
+    let mut ecs = bot.ecs.write();
+    let mut query = ecs.query::<MobRow>();
+    query.get(&ecs, entity).ok().and_then(to_mob)
+}
+
+// ---- who hit us ------------------------------------------------------------------------
+
+/// Entity ids that hurt us, with the game tick it happened at.
+static HURT_BY: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
+static LAST_HURT: AtomicU64 = AtomicU64::new(0);
+
+/// Watches the server's damage events for hits on us, to fight back against what hit us
+/// (a skeleton out of the usual range, a provoked neutral mob).
+pub fn packet(bot: &Client, packet: &ClientboundGamePacket) {
+    if let ClientboundGamePacket::ChangeDifficulty(d) = packet {
+        DIFFICULTY.store(d.difficulty as u8, Ordering::Relaxed);
+        return;
+    }
+    let ClientboundGamePacket::DamageEvent(p) = packet else { return };
+    let Some(me) = bot.component::<MinecraftEntityId>().ok().map(|i| *i) else { return };
+    if p.entity_id != me {
+        return;
+    }
+    let now = bot.ticks_connected();
+    LAST_HURT.store(now, Ordering::Relaxed);
+    if let Some(by) = p.source_cause_id.0 {
+        debug!("hurt by entity {}", by.0);
+        let mut hurt = HURT_BY.lock();
+        hurt.retain(|(id, t)| *id != by.0 && now.saturating_sub(*t) < 600);
+        hurt.push((by.0, now));
+    }
+}
+
+/// The world's difficulty as the server last said (255: not yet).
+static DIFFICULTY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(255);
+
+/// Whether the server said the world is peaceful (no hostile mobs to arm against).
+pub fn peaceful() -> bool {
+    DIFFICULTY.load(Ordering::Relaxed) == 0
+}
+
+/// Whether `id` hurt us within the last `ticks`.
+pub fn hurt_by(bot: &Client, id: MinecraftEntityId, ticks: u64) -> bool {
+    let now = bot.ticks_connected();
+    HURT_BY.lock().iter().any(|(i, t)| *i == id.0 && now.saturating_sub(*t) < ticks)
+}
+
+/// Ticks since anything last hurt us.
+pub fn ticks_since_hurt(bot: &Client) -> u64 {
+    bot.ticks_connected().saturating_sub(LAST_HURT.load(Ordering::Relaxed))
+}
+
+// ---- targets ---------------------------------------------------------------------------
+
+/// Mobs we gave up on (could not reach), and until which tick to leave them be.
+static GIVEN_UP: Mutex<Vec<(Entity, u64)>> = Mutex::new(Vec::new());
+
+fn given_up(bot: &Client, e: Entity) -> bool {
+    let now = bot.ticks_connected();
+    let mut g = GIVEN_UP.lock();
+    g.retain(|(_, until)| *until > now);
+    g.iter().any(|(x, _)| *x == e)
+}
+
+fn give_up(bot: &Client, e: Entity, ticks: u64) {
+    GIVEN_UP.lock().push((e, bot.ticks_connected() + ticks));
+}
+
+/// Whether `m` is something to fight now, and how urgent (lower first).
+fn threat_score(bot: &Client, me: Vec3, m: &Mob) -> Option<f64> {
+    let dy = (m.pos.y - me.y).abs();
+    let d = m.pos.horizontal_distance_squared_to(me).sqrt();
+    let hit_us = hurt_by(bot, m.id, 100);
+    // bare hands do 1 a punch: walk up to nothing, fight only what is on us (the rest is
+    // outrun by `defend`)
+    if !armed(bot) && m.role() != Role::Creeper && (d > 4.0 || dy > 2.5) {
+        return None;
+    }
+    let engage = match m.role() {
+        Role::Melee => d < 10.0 && dy < 5.0,
+        Role::Ranged => d < 14.0 && dy < 6.0,
+        Role::Creeper => d < 8.0 && dy < 4.0,
+        Role::Flying => m.box_distance(me.up(1.62)) < REACH + 0.5,
+        Role::Neutral => hit_us || (m.kind == EntityKind::Enderman && m.angry && d < 16.0),
+        Role::Avoid | Role::Food | Role::Other => false,
+    } || (hit_us && d < 16.0 && m.role() != Role::Avoid && m.kind != EntityKind::Player);
+    if !engage || given_up(bot, m.entity) {
+        return None;
+    }
+    let mut score = d;
+    if hit_us {
+        score -= 4.0;
+    }
+    if m.role() == Role::Creeper {
+        score -= 2.0;
+    }
+    Some(score)
+}
+
+/// The mob to fight now, if any. Cheap: one entity query.
+pub fn pick_target(bot: &Client) -> Option<Mob> {
+    let me = crate::world::me(bot);
+    mobs_near(bot, 20.0)
+        .into_iter()
+        .filter_map(|m| threat_score(bot, me, &m).map(|s| (s, m)))
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, m)| m)
+}
+
+// ---- weapon and cooldown ---------------------------------------------------------------
+
+/// Weapons, best first, with their attack speed (attacks a second at full charge).
+const WEAPONS: &[(ItemKind, f64)] = {
+    use ItemKind::*;
+    &[
+        (NetheriteSword, 1.6),
+        (DiamondSword, 1.6),
+        (IronSword, 1.6),
+        (NetheriteAxe, 1.0),
+        (DiamondAxe, 1.0),
+        (StoneSword, 1.6),
+        (IronAxe, 0.9),
+        (GoldenSword, 1.6),
+        (StoneAxe, 0.8),
+        (WoodenSword, 1.6),
+        (GoldenAxe, 1.0),
+        (WoodenAxe, 0.8),
+    ]
+};
+
+/// Ticks of full charge for the held item: a sword 13 (1.6/s), a fist 5 (4/s).
+fn charge_ticks(held: ItemKind) -> u64 {
+    let speed = WEAPONS.iter().find(|(k, _)| *k == held).map(|(_, s)| *s).unwrap_or(match held {
+        // pickaxes and shovels hit at 1.2 and 1.0; anything else as a fist
+        k if format!("{k:?}").ends_with("Pickaxe") => 1.2,
+        k if format!("{k:?}").ends_with("Shovel") => 1.0,
+        _ => 4.0,
+    });
+    (20.0 / speed).ceil() as u64
+}
+
+/// The game tick of our last swing or weapon change: both restart the charge, on the
+/// server too (it resets the attack ticker when the main hand item changes).
+static CHARGE_START: AtomicU64 = AtomicU64::new(0);
+
+/// Call after changing the held item: the next hit waits for a full charge.
+pub fn note_item_change(bot: &Client) {
+    CHARGE_START.store(bot.ticks_connected(), Ordering::Relaxed);
+}
+
+pub fn held(bot: &Client) -> ItemKind {
+    let slot = bot.selected_hotbar_slot().unwrap_or(0) as usize;
+    inv::player_slots(bot).get(36 + slot).map(|s| s.kind()).unwrap_or(ItemKind::Air)
+}
+
+fn charged(bot: &Client) -> bool {
+    // one tick more than the charge: our tick count and the server's drift by a tick
+    bot.ticks_connected().saturating_sub(CHARGE_START.load(Ordering::Relaxed)) > charge_ticks(held(bot))
+}
+
+/// Whether we carry a sword or an axe.
+pub fn armed(bot: &Client) -> bool {
+    WEAPONS.iter().any(|(k, _)| inv::count_kind(bot, *k) > 0)
+}
+
+/// Holds the best weapon we have (nothing changes if it is already in hand).
+pub async fn hold_weapon(bot: &Client) {
+    let Some(&(best, _)) = WEAPONS.iter().find(|(k, _)| inv::count_kind(bot, *k) > 0) else { return };
+    if held(bot) == best {
+        return;
+    }
+    if inv::hold(bot, &Items::one(best)).await {
+        note_item_change(bot);
+    }
+}
+
+/// Puts a shield into the offhand when there is one and the offhand is empty. A shield in
+/// the offhand is not raised by itself, but `raise_shield` can then block arrows.
+pub async fn equip_shield(bot: &Client) {
+    let slots = inv::player_slots(bot);
+    if slots[45].is_present() {
+        return;
+    }
+    let Some(&(from, _, _)) = inv::slots_of(bot, &Items::one(ItemKind::Shield)).first() else { return };
+    if let Ok(Some(h)) = bot.open_inventory() {
+        // a swap click with button 40 swaps with the offhand
+        h.click(azalea::inventory::operations::SwapClick { source_slot: from as u16, target_slot: 40 });
+        bot.wait_ticks(2).await;
+    }
+}
+
+// ---- fighting --------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Outcome {
+    Killed,
+    /// Out of view, or stopped being a threat (a creeper we ran from).
+    Gone,
+    GaveUp,
+}
+
+pub fn alive(bot: &Client) -> bool {
+    bot.query_self::<&metadata::Health, _>(|h| h.0 > 0.0).unwrap_or(false)
+}
+
+pub fn health(bot: &Client) -> f32 {
+    bot.query_self::<&metadata::Health, _>(|h| h.0).unwrap_or(0.0)
+}
+
+/// Our velocity, on ground, walking into a wall, in water.
+fn physics(bot: &Client) -> (Vec3, bool, bool, bool) {
+    bot.query_self::<&Physics, _>(|p| (p.velocity, p.on_ground(), p.horizontal_collision, p.water_fluid_height > 0.0))
+        .unwrap_or((Vec3::ZERO, true, false, false))
+}
+
+/// Whether a step towards `dir` (horizontal, normalized) from our feet is safe: ground within
+/// a short drop and no lava or fire there.
+fn safe_step(bot: &Client, dir: Vec3) -> bool {
+    let me = crate::world::me(bot);
+    let ahead = azalea::BlockPos::from(me + dir * 0.9);
+    for dy in [0, 1] {
+        let k = crate::world::kind_at(bot, ahead.up(dy));
+        if crate::survival::is_hazard_block(k) {
+            return false;
+        }
+    }
+    for d in 1..=3 {
+        let st = crate::world::block_at(bot, ahead.down(d));
+        let k = crate::world::kind_at(bot, ahead.down(d));
+        if crate::survival::is_hazard_block(k) {
+            return false;
+        }
+        if !st.is_air() && k != azalea::registry::builtin::BlockKind::Water {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sets our yaw and pitch towards `point` without waiting: the movement packet of the next
+/// tick carries them (a rotation packet of our own would make two movement packets in one
+/// tick, which 26.3 kicks for). `click::look` is the same plus the wait.
+pub fn aim(bot: &Client, point: Vec3) {
+    let (yaw, pitch) = crate::click::angles(crate::click::eye(bot), point);
+    let mut ecs = bot.ecs.write();
+    if let Some(mut l) = ecs.get_mut::<LookDirection>(bot.entity) {
+        *l = LookDirection::new(yaw, pitch);
+    }
+}
+
+/// Turns towards `target` (yaw only, eyes level with it), for walking.
+pub fn face(bot: &Client, target: Vec3) {
+    let eye = crate::click::eye(bot);
+    aim(bot, Vec3::new(target.x, eye.y, target.z));
+}
+
+/// The player's `entity_interaction_range`: the client's crosshair picks an entity only
+/// this far from the eyes, and so does ours.
+const ENTITY_RANGE: f64 = 3.0;
+
+/// Unit vector of a look, in Minecraft's yaw/pitch convention (the inverse of
+/// `click::angles`).
+pub fn look_vector(yaw: f32, pitch: f32) -> Vec3 {
+    let (y, p) = ((yaw as f64).to_radians(), (pitch as f64).to_radians());
+    Vec3::new(-y.sin() * p.cos(), -p.sin(), y.cos() * p.cos())
+}
+
+/// Where a ray from `from` (unit `dir`) enters `m`'s box; 0 when it starts inside.
+fn ray_into(from: Vec3, dir: Vec3, m: &Mob) -> Option<f64> {
+    let r = m.width / 2.0;
+    let (lo, hi) = (Vec3::new(m.pos.x - r, m.pos.y, m.pos.z - r), Vec3::new(m.pos.x + r, m.pos.y + m.height, m.pos.z + r));
+    let mut t0 = 0.0f64;
+    let mut t1 = f64::INFINITY;
+    for (o, d, a, b) in [(from.x, dir.x, lo.x, hi.x), (from.y, dir.y, lo.y, hi.y), (from.z, dir.z, lo.z, hi.z)] {
+        if d.abs() < 1e-12 {
+            if o < a || o > b {
+                return None;
+            }
+            continue;
+        }
+        let (u, v) = ((a - o) / d, (b - o) / d);
+        t0 = t0.max(u.min(v));
+        t1 = t1.min(u.max(v));
+    }
+    (t0 <= t1).then_some(t0)
+}
+
+/// What a crosshair along `dir` from our eyes would pick, as the client's pick does it:
+/// the nearest entity box the ray enters within the entity range, unless a block's outline
+/// (grass and flowers included, as in the game) comes first. `others` are the mobs that
+/// could be in the way. Returns the distance when it is `m`.
+fn picks(bot: &Client, eye: Vec3, dir: Vec3, m: &Mob, others: &[Mob]) -> Option<f64> {
+    let t = ray_into(eye, dir, m).filter(|t| *t <= ENTITY_RANGE)?;
+    if others.iter().any(|o| o.entity != m.entity && ray_into(eye, dir, o).is_some_and(|u| u < t)) {
+        return None;
+    }
+    if t > 0.0 && crate::click::raycast(bot, eye, dir, t).is_some_and(|h| h.dist < t) {
+        return None;
+    }
+    Some(t)
+}
+
+/// A point on `m` (moved by `lead`) our eyes see in the entity range with nothing in
+/// between: the middle of its box at our eye height first, then higher and lower (over
+/// grass, under a ledge). None when no such point: walk closer, or around.
+fn aim_point(bot: &Client, eye: Vec3, m: &Mob, lead: Vec3, others: &[Mob]) -> Option<Vec3> {
+    let moved = Mob { pos: m.pos + lead, ..m.clone() };
+    let (y0, h) = (moved.pos.y, moved.height);
+    let r = (moved.width / 2.0 - 0.1).max(0.05);
+    let c = moved.pos;
+    let mut ys = vec![eye.y.clamp(y0 + 0.15 * h, y0 + 0.85 * h), y0 + 0.8 * h, y0 + 0.5 * h, y0 + 0.25 * h];
+    ys.dedup_by(|a, b| (*a - *b).abs() < 0.05);
+    // the middle, then the side towards us (round a corner)
+    let near = moved.nearest_point(eye);
+    let toward = Vec3::new(near.x.clamp(c.x - r, c.x + r), 0.0, near.z.clamp(c.z - r, c.z + r));
+    for (x, z) in [(c.x, c.z), (toward.x, toward.z)] {
+        for &y in &ys {
+            let p = Vec3::new(x, y, z);
+            let d = p - eye;
+            let len = d.length();
+            if len < 1e-6 {
+                return Some(p);
+            }
+            if picks(bot, eye, d * (1.0 / len), &moved, others).is_some() {
+                return Some(p);
+            }
+        }
+    }
+    None
+}
+
+/// The plant in the way (grass, a flower: broken at once) when one hides `m` from our
+/// eyes: a player knocks it away with the first click, and so do we.
+fn plant_in_way(bot: &Client, eye: Vec3, m: &Mob) -> Option<azalea::BlockPos> {
+    let p = Vec3::new(m.pos.x, eye.y.clamp(m.pos.y + 0.15 * m.height, m.pos.y + 0.85 * m.height), m.pos.z);
+    let d = p - eye;
+    let len = d.length();
+    let hit = crate::click::raycast(bot, eye, d * (1.0 / len.max(1e-6)), len)?;
+    let state = crate::world::block_at(bot, hit.pos);
+    let kind = azalea::registry::builtin::BlockKind::from(state);
+    let instant = state.to_trait().behavior().destroy_time == 0.0;
+    (instant && hit.dist < crate::click::REACH && !crate::survival::is_hazard_block(kind) && crate::dig::breakable(state)).then_some(hit.pos)
+}
+
+/// Hits `target` with what we hold: our own attack packet, then the arm swing.
+///
+/// As a player's click: the look the server already has (sent in the last tick's movement
+/// packet) must put the crosshair on the target's box, within the entity range of 3.0
+/// from the eyes, with no block outline and no other mob in front of it. Then what the
+/// server's `handleAttack` checks: the target is in our world, it is not an item, an orb,
+/// an arrow or ourselves (any of those is a kick), and our weapon's charge (we wait for a
+/// full one; the server counts ticks since the last `ServerboundPunch`, which resets it,
+/// so the punch goes after the attack). Returns whether the hit was sent.
+pub fn strike(bot: &Client, target: Entity) -> bool {
+    let Some(m) = mob(bot, target) else { return false };
+    // the same world: a mob row from the dimension we just left is not attackable
+    let ours = bot.component::<WorldName>().ok().map(|w| w.clone());
+    let theirs = bot.ecs.read().get::<WorldName>(target).cloned();
+    if ours.is_none() || ours != theirs || m.entity == bot.entity {
+        return false;
+    }
+    if !charged(bot) || !alive(bot) {
+        return false;
+    }
+    let Ok(look) = bot.direction() else { return false };
+    let eye = crate::click::eye(bot);
+    let dir = look_vector(look.y_rot(), look.x_rot());
+    let others = mobs_near(bot, ENTITY_RANGE + 3.0);
+    let Some(dist) = picks(bot, eye, dir, &m, &others) else {
+        debug!("not hitting {:?}: not in the crosshair (box {:.2} away)", m.kind, m.box_distance(eye));
+        return false;
+    };
+    bot.write_packet(ServerboundAttack { entity_id: m.id });
+    bot.write_packet(ServerboundPunch);
+    CHARGE_START.store(bot.ticks_connected(), Ordering::Relaxed);
+    // a sprinting hit knocks back and ends the sprint, on the server; walk instead
+    if bot.query_self::<&metadata::Sprinting, _>(|s| s.0).unwrap_or(false) {
+        bot.walk(WalkDirection::Forward);
+    }
+    debug!("hit {:?} (hp {:.0}) at {dist:.2}", m.kind, m.health);
+    true
+}
+
+/// Fights `target` until it dies, leaves, or `limit` passes. Steps of one game tick.
+pub async fn fight(bot: &Client, target: Entity, limit: Duration) -> Result<Outcome> {
+    let Some(first) = mob(bot, target) else { return Ok(Outcome::Gone) };
+    let role = first.role();
+    info!("fight {:?} at {:.1} blocks (hp {:.0}, ours {:.0})", first.kind, first.pos.distance_to(crate::world::me(bot)), first.health, health(bot));
+    hold_weapon(bot).await;
+    let avoid = role == Role::Creeper && (!WEAPONS.iter().any(|(k, _)| *k == held(bot)) || health(bot) < 10.0);
+    if avoid {
+        info!("keeping away from the creeper (weapon {:?}, hp {:.0})", held(bot), health(bot));
+    }
+    let start = Instant::now();
+    let mut last_pos = first.pos;
+    let mut last_kind = first.kind;
+    let mut pathing_to: Option<Vec3> = None;
+    let mut path_issued = 0u64;
+    let mut direct_until = 0u64;
+    let mut retreat_until = 0u64;
+    let mut fleeing = false;
+    let mut hits = 0;
+    let mut want_hit = false;
+    // ticks near it without a clear line to it (a wall, a fence): then the path goes round
+    let mut unseen = 0u32;
+    let mut path_until = 0u64;
+    // progress: the target's health or distance must change now and then, else it is out
+    // of reach (behind a wall, up a cliff) and we leave it
+    let mut best = (first.health, first.box_distance(crate::world::me(bot).up(1.62)));
+    let mut last_progress = Instant::now();
+    let outcome = loop {
+        if !alive(bot) {
+            break Outcome::Gone;
+        }
+        let Some(m) = mob(bot, target) else {
+            let exists = bot.ecs.read().get_entity(target).is_ok();
+            info!("fight: {last_kind:?} no longer seen (entity {}), last at {:.1} blocks", if exists { "still there" } else { "removed" }, last_pos.distance_to(crate::world::me(bot)));
+            break if last_pos.distance_to(crate::world::me(bot)) < 8.0 { Outcome::Killed } else { Outcome::Gone };
+        };
+        last_kind = m.kind;
+        let now = bot.ticks_connected();
+        let me = crate::world::me(bot);
+        let eye = crate::click::eye(bot);
+        let vel = m.pos - last_pos;
+        last_pos = m.pos;
+        let dist = m.box_distance(eye);
+        let flat = Vec3::new(m.pos.x - me.x, 0.0, m.pos.z - me.z);
+        let flat_d = flat.length().max(0.001);
+        let toward = flat * (1.0 / flat_d);
+
+        if m.health < best.0 - 0.1 || dist < best.1 - 0.5 {
+            best = (best.0.min(m.health), best.1.min(dist));
+            last_progress = Instant::now();
+        }
+        if start.elapsed() > limit || last_progress.elapsed() > Duration::from_secs(12) {
+            info!("fight: giving up on {:?} ({:.1} away, hp {:.0})", m.kind, dist, m.health);
+            give_up(bot, target, 1200);
+            break Outcome::GaveUp;
+        }
+        // losing: a few hearts left and it is far from dead. Out, to run and eat (`defend`)
+        if role != Role::Food && health(bot) < LOW_HP && m.health > 4.0 {
+            info!("fight: leaving {:?} (hp {:.0}) with our hp {:.0}", m.kind, m.health, health(bot));
+            give_up(bot, target, 100);
+            break Outcome::GaveUp;
+        }
+        // a creeper about to blow: run until it stops (it swells only within 7 blocks)
+        // without a weapon (20 punches) or hurt, a creeper is not fought: kept away from
+        if role == Role::Creeper && avoid && flat_d > 10.0 {
+            info!("creeper left behind at {flat_d:.1}");
+            give_up(bot, target, 300);
+            break Outcome::Gone;
+        }
+        if role == Role::Creeper && ((m.swelling && (flat_d < 7.5 || fleeing)) || avoid) {
+            if !fleeing && !avoid {
+                info!("creeper swelling at {flat_d:.1}, running");
+            }
+            if pathing_to.take().is_some() {
+                crate::world::stop_path(bot).await;
+            }
+            fleeing = true;
+            let away = me - toward * 4.0;
+            face(bot, away);
+            if safe_step(bot, toward * -1.0) {
+                bot.sprint(azalea::SprintDirection::Forward);
+            } else {
+                bot.walk(WalkDirection::Left);
+            }
+            let (_, on_ground, blocked, in_water) = physics(bot);
+            bot.set_jumping(in_water || (blocked && on_ground)).ok();
+            bot.wait_ticks(1).await;
+            continue;
+        }
+        if fleeing {
+            // it stopped swelling: come back for the next hit (or leave it, if we must)
+            fleeing = false;
+            bot.walk(WalkDirection::None);
+            if health(bot) < 8.0 {
+                give_up(bot, target, 1200);
+                break Outcome::Gone;
+            }
+        }
+
+        let (_, _, _, in_water) = physics(bot);
+        // the pathfinder finds no path out of water, nor to a mob standing in it: when it
+        // has nothing after a second, walk (swim) straight at it for a while
+        if pathing_to.is_some() && now.saturating_sub(path_issued) > 40 && !bot.is_executing_path() {
+            direct_until = now + 60;
+        }
+        let close = flat_d < 4.5 && (m.pos.y - me.y).abs() < 2.0;
+        let direct = (close && now >= path_until) || in_water || now < direct_until || role == Role::Flying;
+        if !direct {
+            // far, or above/below: the pathfinder knows the way round
+            let moved = pathing_to.is_none_or(|p| p.distance_to(m.pos) > 2.0);
+            if moved && now.saturating_sub(path_issued) >= 10 {
+                bot.start_goto(RadiusGoal::new(m.pos, 2.0));
+                pathing_to = Some(m.pos);
+                path_issued = now;
+            }
+        } else {
+            if pathing_to.take().is_some() {
+                // waited for: a goto sent before the stop is read gets cancelled by it
+                crate::world::stop_path(bot).await;
+            }
+            // aim at a point of its box we see, a tick ahead of its movement; none in
+            // sight: face it and keep walking in
+            let others = mobs_near(bot, ENTITY_RANGE + 3.0);
+            let seen = aim_point(bot, eye, &m, vel, &others);
+            match seen {
+                Some(p) => {
+                    aim(bot, p);
+                    unseen = 0;
+                }
+                None => {
+                    if let Some(plant) = plant_in_way(bot, eye, &m) {
+                        bot.walk(WalkDirection::None);
+                        match crate::dig::dig(bot, plant).await {
+                            Ok(()) => debug!("broke the {:?} between us and {:?}", crate::world::kind_at(bot, plant), m.kind),
+                            Err(e) => debug!("could not clear {plant}: {e}"),
+                        }
+                        hold_weapon(bot).await;
+                        continue;
+                    }
+                    face(bot, m.center());
+                    unseen += 1;
+                    if unseen > 30 && !in_water {
+                        debug!("{:?} close but not in sight: pathing round", m.kind);
+                        path_until = now + 60;
+                        unseen = 0;
+                    }
+                }
+            }
+            let walk = if now < retreat_until {
+                WalkDirection::Backward
+            } else if (dist > REACH - 0.6 || (seen.is_none() && dist > 1.0)) && role != Role::Flying {
+                if !in_water && !safe_step(bot, toward) {
+                    WalkDirection::None
+                } else if role == Role::Ranged && dist > 2.0 {
+                    // a skeleton aims where we walk: side to side makes it miss
+                    if (now / 15) % 2 == 0 { WalkDirection::ForwardLeft } else { WalkDirection::ForwardRight }
+                } else {
+                    WalkDirection::Forward
+                }
+            } else if role == Role::Creeper && !charged(bot) {
+                // wait for the charge outside its swelling range
+                WalkDirection::Backward
+            } else {
+                WalkDirection::None
+            };
+            bot.walk(walk);
+            let (_, on_ground, blocked, _) = physics(bot);
+            let forward = matches!(walk, WalkDirection::Forward | WalkDirection::ForwardLeft | WalkDirection::ForwardRight);
+            // jumping is swimming up in water: keeps our head out of it
+            bot.set_jumping(in_water || (blocked && on_ground && forward)).ok();
+            // the hit goes out next tick, after the movement packet with this look
+            want_hit = seen.is_some() && charged(bot);
+        }
+        bot.wait_ticks(1).await;
+        if std::mem::take(&mut want_hit) && strike(bot, target) {
+            hits += 1;
+            if role == Role::Creeper {
+                // its knockback plus our steps back keep it out of its 3-block trigger
+                retreat_until = bot.ticks_connected() + 10;
+            }
+        }
+    };
+    if pathing_to.is_some() {
+        crate::world::stop_path(bot).await;
+    }
+    bot.walk(WalkDirection::None);
+    bot.set_jumping(false).ok();
+    info!("fight {last_kind:?}: {outcome:?} after {hits} hits, {:.1}s, our hp {:.0}", start.elapsed().as_secs_f64(), health(bot));
+    Ok(outcome)
+}
+
+/// Health below which a fight is left for running and eating.
+const LOW_HP: f32 = 7.0;
+
+/// Runs from `threats` for `ticks`: sprinting (walking when too hungry to sprint) away from
+/// where they stand, turning aside from a drop or lava, jumping up steps.
+pub async fn flee(bot: &Client, threats: &[Mob], ticks: u32) {
+    if threats.is_empty() {
+        return;
+    }
+    crate::world::stop_path(bot).await;
+    info!("running from {:?} (hp {:.0})", threats.iter().map(|m| m.kind).collect::<Vec<_>>(), health(bot));
+    let can_sprint = crate::survival::food_level(bot) > 6;
+    for _ in 0..ticks {
+        if !alive(bot) {
+            break;
+        }
+        let me = crate::world::me(bot);
+        // away from each, the nearer the more
+        let mut away = Vec3::ZERO;
+        for m in threats {
+            if let Some(now) = mob(bot, m.entity) {
+                let d = Vec3::new(me.x - now.pos.x, 0.0, me.z - now.pos.z);
+                let len = d.length().max(0.5);
+                away = away + d * (1.0 / (len * len));
+            }
+        }
+        let len = away.length();
+        if len < 1e-6 {
+            break;
+        }
+        let dir = away * (1.0 / len);
+        // the first safe heading of: straight away, then turning aside more and more
+        let heading = [0.0f64, 40.0, -40.0, 80.0, -80.0, 120.0, -120.0]
+            .iter()
+            .map(|a| {
+                let (s, c) = a.to_radians().sin_cos();
+                Vec3::new(dir.x * c - dir.z * s, 0.0, dir.x * s + dir.z * c)
+            })
+            .find(|h| safe_step(bot, *h));
+        let Some(h) = heading else {
+            bot.walk(WalkDirection::None);
+            bot.wait_ticks(1).await;
+            continue;
+        };
+        face(bot, me + h * 4.0);
+        if can_sprint {
+            bot.sprint(azalea::SprintDirection::Forward);
+        } else {
+            bot.walk(WalkDirection::Forward);
+        }
+        let (_, on_ground, blocked, in_water) = physics(bot);
+        bot.set_jumping(in_water || (blocked && on_ground)).ok();
+        bot.wait_ticks(1).await;
+    }
+    bot.walk(WalkDirection::None);
+    bot.set_jumping(false).ok();
+}
+
+/// Fights whatever threatens us until nothing does (a few at most). Returns how many
+/// fights there were.
+pub async fn defend(bot: &Client) -> Result<usize> {
+    let mut n = 0;
+    let mut runs = 0;
+    while n < 8 {
+        // hurt with hostiles about, or bare-handed with them closing in: run first, eat
+        // when out of their reach
+        let hostile = |m: &Mob| matches!(m.role(), Role::Melee | Role::Ranged | Role::Creeper);
+        let me = crate::world::me(bot);
+        let near: Vec<Mob> = mobs_near(bot, 16.0).into_iter().filter(|m| hostile(m) && (m.pos.y - me.y).abs() < 6.0).collect();
+        let low = health(bot) < LOW_HP && !near.is_empty();
+        let chased = !armed(bot) && near.iter().any(|m| m.box_distance(crate::click::eye(bot)) < 8.0 && m.role() != Role::Creeper);
+        if (low || chased) && runs < 3 {
+            runs += 1;
+            flee(bot, &near, 60).await;
+            if low {
+                crate::survival::eat_if_needed(bot).await?;
+            }
+            if !alive(bot) {
+                break;
+            }
+            continue;
+        }
+        let Some(t) = pick_target(bot) else { break };
+        // hurt and with a moment before it arrives: eat first, the fight goes better with
+        // the health coming back
+        if health(bot) < 10.0 && t.pos.distance_to(crate::world::me(bot)) > 6.0 {
+            crate::survival::eat_if_needed(bot).await?;
+        }
+        let limit = if t.role() == Role::Creeper { 25 } else { 30 };
+        let out = fight(bot, t.entity, Duration::from_secs(limit)).await?;
+        n += 1;
+        if out == Outcome::Killed && matches!(t.kind, EntityKind::Enderman | EntityKind::Blaze) {
+            // ender pearls and blaze rods are worth the steps
+            crate::world::collect_drops(bot, t.pos, 6.0).await;
+        }
+        if !alive(bot) {
+            break;
+        }
+    }
+    Ok(n)
+}
+
+/// Kills one mob of `kinds` within `radius` (nearest), for what it drops. Picks the drops up.
+pub async fn hunt(bot: &Client, kinds: &[EntityKind], radius: f64) -> Result<Outcome> {
+    let me = crate::world::me(bot);
+    let Some(m) = mobs_near(bot, radius)
+        .into_iter()
+        .filter(|m| kinds.contains(&m.kind) && !m.baby && !given_up(bot, m.entity))
+        .min_by(|a, b| a.pos.distance_squared_to(me).total_cmp(&b.pos.distance_squared_to(me)))
+    else {
+        bail!("no {kinds:?} within {radius}");
+    };
+    let out = fight(bot, m.entity, Duration::from_secs(45)).await?;
+    if out == Outcome::Killed {
+        // the drop lands where it died; give the server a moment to spawn the items
+        bot.wait_ticks(5).await;
+        let at = mob(bot, m.entity).map(|x| x.pos).unwrap_or(m.pos);
+        crate::world::collect_drops(bot, at, 6.0).await;
+    }
+    Ok(out)
+}
+
+/// `goto` with a deadline that stops to fight or eat when something needs it, then walks on
+/// to the same goal. Every walk of the run goes through here (`world::goto_timeout`), so a
+/// zombie met on the way is fought instead of followed home.
+pub async fn goto_guarded<G: Goal + Clone + 'static>(bot: &Client, goal: G, limit: Duration) -> Result<()> {
+    // game ticks, so the check means the same at any server tick rate; mining a block on
+    // the way stands still too, so the window is longer than any block the path mines
+    const STUCK_WINDOW: u32 = 100;
+    let mut deadline = Instant::now() + limit;
+    bot.start_goto(goal.clone());
+    // make sure the goto event was handled before asking whether the goal is reached
+    bot.wait_updates(1).await;
+    let mut ticks = 0u32;
+    let mut window = (0u32, crate::world::me(bot));
+    loop {
+        if bot.is_goto_target_reached() {
+            return Ok(());
+        }
+        if Instant::now() > deadline {
+            crate::world::stop_path(bot).await;
+            bail!("path timed out");
+        }
+        bot.wait_ticks(1).await;
+        ticks += 1;
+        if ticks - window.0 >= STUCK_WINDOW {
+            let now = crate::world::me(bot);
+            if now.distance_to(window.1) < 0.5 {
+                crate::world::stop_path(bot).await;
+                bail!("path stuck: no move in {STUCK_WINDOW} ticks");
+            }
+            window = (ticks, now);
+        }
+        if ticks % 4 == 0 && crate::survival::urgent(bot) {
+            crate::world::stop_path(bot).await;
+            bot.walk(WalkDirection::None);
+            let paused = Instant::now();
+            crate::survival::tend(bot).await?;
+            deadline += paused.elapsed();
+            bot.start_goto(goal.clone());
+            bot.wait_updates(1).await;
+            window = (ticks, crate::world::me(bot));
+        }
+    }
+}

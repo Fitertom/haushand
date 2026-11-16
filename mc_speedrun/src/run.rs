@@ -36,6 +36,10 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
         "wood" => {
             obtain(bot, craft::logs(), 6).await?;
             obtain(bot, Items::one(ItemKind::WoodenPickaxe), 1).await?;
+            // bare hands lose to a zombie at night; two planks and a stick do not
+            if !crate::combat::peaceful() && !crate::combat::armed(bot) {
+                obtain(bot, Items::one(ItemKind::WoodenSword), 1).await?;
+            }
         }
         "stone" => {
             obtain(bot, Items::one(ItemKind::StonePickaxe), 1).await?;
@@ -153,6 +157,101 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
             h.shift_click(0usize);
             bot.wait_ticks(10).await; dump(bot, "taken");
         }
+        // Stock up on food (hunt, cook when a furnace and coal are near).
+        "food" => crate::survival::stock_food(bot, 30).await?,
+        // Combat tests; the bot must be op for the commands (rcon "op SpeedBot").
+        // `fight`: one of each common hostile summoned 6 blocks away, fought one at a time.
+        "fight" => {
+            bot.chat("/time set midnight");
+            if crate::inv::count_kind(bot, ItemKind::StoneSword) == 0 {
+                bot.chat("/give @s stone_sword");
+            }
+            for kind in ["zombie", "skeleton", "spider", "creeper", "husk", "enderman"] {
+                bot.chat(format!("/summon minecraft:{kind} ~6 ~ ~{}", if kind == "enderman" { " {AngerTime:600}" } else { "" }));
+                bot.wait_ticks(20).await;
+                let hp = crate::combat::health(bot);
+                let t0 = std::time::Instant::now();
+                let n = test_fight(bot).await?;
+                info!("test fight {kind}: {n} fights in {:.1}s, hp {hp:.0} -> {:.0}, left {:?}", t0.elapsed().as_secs_f64(), crate::combat::health(bot), crate::combat::mobs_near(bot, 16.0).iter().map(|m| m.kind).collect::<Vec<_>>());
+                bot.chat("/effect give @s instant_health 1 3");
+                bot.wait_ticks(10).await;
+            }
+        }
+        // `fightn <n>`-like: several zombies at once.
+        "crowd" => {
+            bot.chat("/time set midnight");
+            for dx in [5, -5, 0] {
+                bot.chat(format!("/summon minecraft:zombie ~{dx} ~ ~5"));
+            }
+            bot.wait_ticks(20).await;
+            let n = test_fight(bot).await?;
+            info!("test crowd: {n} fights, hp {:.0}", crate::combat::health(bot));
+        }
+        // `eat`: food given, the bar drained by a hunger effect, then eaten back up.
+        "eat" => {
+            bot.chat("/time set day");
+            bot.chat("/give @s cooked_beef 3");
+            bot.chat("/give @s bread 3");
+            bot.chat("/effect give @s hunger 60 200");
+            for _ in 0..600 {
+                if crate::survival::food_level(bot) <= 8 { break }
+                bot.wait_ticks(5).await;
+            }
+            bot.chat("/effect clear @s hunger");
+            bot.wait_ticks(10).await;
+            info!("test eat: food {} before", crate::survival::food_level(bot));
+            crate::survival::eat_if_needed(bot).await?;
+            info!("test eat: food {} after, left beef {} bread {}", crate::survival::food_level(bot), crate::inv::count_kind(bot, ItemKind::CookedBeef), crate::inv::count_kind(bot, ItemKind::Bread));
+        }
+        // `hunt`: no food, hungry, a cow and a pig nearby: kill one and eat it raw.
+        "hunt" => {
+            bot.chat("/clear @s");
+            bot.chat("/give @s stone_sword");
+            bot.chat("/time set day");
+            bot.chat("/summon minecraft:cow ~8 ~ ~3");
+            bot.chat("/summon minecraft:pig ~-6 ~ ~6");
+            bot.chat("/effect give @s hunger 60 200");
+            for _ in 0..600 {
+                if crate::survival::food_level(bot) <= 12 { break }
+                bot.wait_ticks(5).await;
+            }
+            bot.chat("/effect clear @s hunger");
+            bot.wait_ticks(10).await;
+            info!("test hunt: food {} before", crate::survival::food_level(bot));
+            crate::survival::tend(bot).await?;
+            info!("test hunt: food {} after, carrying {} points", crate::survival::food_level(bot), crate::survival::food_points(bot));
+        }
+        // `lava`: lava put at our feet (fire resistance so a slow escape is not a death).
+        "lava" => {
+            bot.chat("/time set day");
+            bot.chat("/effect give @s fire_resistance 30");
+            bot.wait_ticks(5).await;
+            bot.chat("/setblock ~ ~ ~ lava");
+            bot.wait_ticks(10).await;
+            let urgent = crate::survival::urgent(bot);
+            crate::survival::tend(bot).await?;
+            info!("test lava: urgent {urgent}, now at {} in {:?}", crate::world::feet(bot), crate::world::kind_at(bot, crate::world::feet(bot)));
+        }
+        // `die`: killed once; after the respawn the stage runs again and ends.
+        "die" => {
+            bot.chat("/time set day");
+            static DIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !DIED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                bot.chat("/give @s cobblestone 5");
+                bot.wait_ticks(10).await;
+                bot.chat("/kill @s");
+                bot.wait_ticks(200).await;
+                bail!("still alive after /kill");
+            }
+            info!("test die: resumed after death at {}, cobblestone {}", crate::world::feet(bot), crate::inv::count_kind(bot, ItemKind::Cobblestone));
+        }
+        // `guard`: stand and tend for a while (at night on easy: does it survive).
+        "guard" => {
+            for _ in 0..120 {
+                crate::survival::tend(bot).await?;
+                bot.wait_ticks(10).await;
+            }
+        }
         "probe" => {
             let f = crate::world::feet(bot);
             use azalea::physics::collision::BlockWithShape;
@@ -173,4 +272,21 @@ async fn stage_body(bot: &Client, name: &str) -> Result<()> {
         other => bail!("unknown stage {other}; stages: {}", STAGES.join(", ")),
     }
     Ok(())
+}
+
+/// Tends until no hostile is in view (or a minute passes); returns how many fights.
+async fn test_fight(bot: &Client) -> Result<usize> {
+    let t0 = std::time::Instant::now();
+    let mut n = 0;
+    while t0.elapsed() < std::time::Duration::from_secs(60) {
+        let f = crate::combat::defend(bot).await?;
+        n += f;
+        if f == 0 {
+            if crate::combat::mobs_near(bot, 20.0).iter().all(|m| !matches!(m.role(), crate::combat::Role::Melee | crate::combat::Role::Ranged | crate::combat::Role::Creeper)) {
+                break;
+            }
+            bot.wait_ticks(5).await;
+        }
+    }
+    Ok(n)
 }

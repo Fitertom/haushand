@@ -84,34 +84,9 @@ pub async fn reach(bot: &Client, pos: BlockPos) -> Result<()> {
 /// `goto` with a deadline: a path that never ends (a goal walled off) must not hang a run.
 /// Also gives up early when the bot has not moved for a while: a goal the pathfinder
 /// cannot reach (a log up in a crown) left it standing for the whole deadline.
-pub async fn goto_timeout(bot: &Client, goal: impl azalea::pathfinder::goals::Goal + 'static, limit: Duration) -> Result<()> {
-    let stuck = async {
-        // game ticks, so the check means the same at any server tick rate; mining a block
-        // on the way stands still too, so the window is longer than any block the path mines
-        const WINDOW: usize = 100;
-        let mut last = me(bot);
-        loop {
-            bot.wait_ticks(WINDOW).await;
-            let now = me(bot);
-            if now.distance_to(last) < 0.5 {
-                return;
-            }
-            last = now;
-        }
-    };
-    tokio::select! {
-        r = tokio::time::timeout(limit, bot.goto(goal)) => match r {
-            Ok(()) => Ok(()),
-            Err(_) => {
-                stop_path(bot).await;
-                bail!("path timed out")
-            }
-        },
-        () = stuck => {
-            stop_path(bot).await;
-            bail!("path stuck: no move in 100 ticks")
-        }
-    }
+/// Stops on the way to fight or eat when needed (`combat::goto_guarded`).
+pub async fn goto_timeout(bot: &Client, goal: impl azalea::pathfinder::goals::Goal + Clone + 'static, limit: Duration) -> Result<()> {
+    crate::combat::goto_guarded(bot, goal, limit).await
 }
 
 /// Stops the pathfinder and waits for it to take the stop. The stop is a message read in
@@ -211,6 +186,7 @@ pub async fn find_or_explore(bot: &Client, states: &BlockStates, avoid: &[BlockP
     // eight legs of a widening spiral, then give up: 8 × 64 blocks is far past any biome
     let dirs = [(1, 0), (0, 1), (-1, 0), (0, -1)];
     for leg in 0..12 {
+        crate::survival::tend(bot).await?;
         if let Some(pos) = reachable(bot) {
             return Ok(pos);
         }
@@ -243,6 +219,7 @@ pub async fn wait_for_world(bot: &Client) {
 pub async fn mine_until(bot: &Client, states: &BlockStates, items: &Items, want: i32) -> Result<()> {
     let mut failed: Vec<BlockPos> = Vec::new();
     while inv::count(bot, items) < want {
+        crate::survival::tend(bot).await?;
         let pos = find_or_explore(bot, states, &failed).await?;
         info!("mining {:?} at {pos} ({}/{want})", kind_at(bot, pos), inv::count(bot, items));
         if let Err(e) = mine_at(bot, pos).await {
